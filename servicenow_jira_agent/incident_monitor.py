@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -51,6 +52,7 @@ CSV_FIELDS = [
     "number",
     "sys_id",
     "short_description",
+    "description",
     "state",
     "priority",
     "opened_at",
@@ -59,17 +61,112 @@ CSV_FIELDS = [
     "category",
 ]
 
+# System prompt used to ask the LLM whether an incident (that isn't already
+# routed to POC_DATA by assignment group) is a data issue and should still
+# go to Jira, or is a general issue that belongs on ServiceDesk.
+CLASSIFY_SYSTEM_PROMPT = """
+You are triaging IT support incidents for routing.
+
+Read the incident's short description and description and decide whether it
+describes a DATA issue: e.g. incorrect, missing, duplicate, delayed,
+corrupted, or inconsistent data; problems with a data pipeline, ETL job,
+report, dashboard, database, or data quality/data feed. If it is a data
+issue, respond with JIRA.
+
+If it is a general IT/operational issue instead (hardware, access/password,
+software install, network/connectivity, email, printer, application error
+unrelated to data, etc.), respond with SERVICEDESK.
+
+Respond with exactly one word, JIRA or SERVICEDESK, and nothing else.
+""".strip()
+
+# Cache of LLM classification results for this process, keyed by the
+# incident text, so the same incident's description isn't re-sent to the
+# LLM every time categorize_incident() is called for it (e.g. once when
+# writing output, once when printing).
+_llm_category_cache: dict[str, str] = {}
+_llm_client = None
+
+
+def _get_llm():
+    """
+    Lazily build and cache the OpenAI chat model used for classification.
+    Only imported/instantiated when actually needed, so incidents that are
+    already resolved by assignment group never require an OpenAI call.
+    """
+    global _llm_client
+    if _llm_client is None:
+        from langchain_openai import ChatOpenAI
+
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. Add it to your .env file or "
+                "environment to enable LLM-based incident classification."
+            )
+        _llm_client = ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0,
+        )
+    return _llm_client
+
+
+def _classify_with_llm(short_description: str, description: str) -> str:
+    """
+    Ask the OpenAI LLM whether an incident's short description/description
+    describe a data issue ("Jira") or a general issue ("ServiceDesk").
+
+    Never raises: if the LLM call fails for any reason (missing API key,
+    network error, etc.) this logs a warning and falls back to
+    "ServiceDesk" so monitoring keeps running.
+    """
+    short_description = (short_description or "").strip()
+    description = (description or "").strip()
+
+    cache_key = f"{short_description}\x1f{description}"
+    if cache_key in _llm_category_cache:
+        return _llm_category_cache[cache_key]
+
+    if not short_description and not description:
+        _llm_category_cache[cache_key] = "ServiceDesk"
+        return "ServiceDesk"
+
+    user_content = f"Short description: {short_description or '(none)'}"
+    if description:
+        user_content += f"\nDescription: {description}"
+
+    try:
+        llm = _get_llm()
+        response = llm.invoke(
+            [
+                {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ]
+        )
+        answer = (response.content or "").strip().upper()
+        category = "Jira" if "JIRA" in answer else "ServiceDesk"
+    except Exception as e:  # noqa: BLE001 - never let LLM issues break monitoring
+        print(
+            f"Warning: LLM classification failed ({e}); defaulting to ServiceDesk.",
+            file=sys.stderr,
+        )
+        category = "ServiceDesk"
+
+    _llm_category_cache[cache_key] = category
+    return category
+
 
 def categorize_incident(incident: Incident) -> str:
     """
-    Categorize an incident based on its assignment group:
-    - Assigned to the POC_DATA group -> "Jira"
-    - Anything else -> "ServiceDesk"
+    Categorize an incident:
+    1. Assigned to the POC_DATA group -> "Jira".
+    2. Otherwise, ask an LLM (OpenAI) to read the short description and
+       description and decide whether it's a data issue ("Jira") or a
+       general issue ("ServiceDesk").
     """
     group = (incident.assignment_group or "").strip().lower().replace(" ", "_")
     if group == JIRA_ASSIGNMENT_GROUP.lower():
         return "Jira"
-    return "ServiceDesk"
+    return _classify_with_llm(incident.short_description, incident.description)
 
 
 def load_state(state_path: Path) -> dict:

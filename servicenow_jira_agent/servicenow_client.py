@@ -32,6 +32,7 @@ class Incident:
     opened_at: str
     caller: str
     assignment_group: str
+    description: str = ""
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> "Incident":
@@ -52,6 +53,7 @@ class Incident:
             opened_at=_val("opened_at"),
             caller=_val("caller_id"),
             assignment_group=_val("assignment_group"),
+            description=_val("description"),
         )
 
 
@@ -114,8 +116,8 @@ class ServiceNowClient:
             "sysparm_limit": limit,
             "sysparm_display_value": "true",
             "sysparm_fields": (
-                "number,sys_id,short_description,state,priority,opened_at,"
-                "caller_id,assignment_group"
+                "number,sys_id,short_description,description,state,priority,"
+                "opened_at,caller_id,assignment_group"
             ),
         }
         if query_parts:
