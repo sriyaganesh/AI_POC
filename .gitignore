@@ -1,0 +1,13 @@
+# Environment and secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime / generated data
+.incident_monitor_state.json
+new_incidents.csv
