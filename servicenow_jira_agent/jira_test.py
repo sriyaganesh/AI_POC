@@ -1,16 +1,19 @@
 import os
 import requests
 from requests.auth import HTTPBasicAuth
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 # ============================================================
 # Jira Configuration
 # ============================================================
 
-JIRA_URL = "https://aipocsri.atlassian.net"
-JIRA_EMAIL = "srividhyaganesan1988@gmail.com"
-JIRA_API_TOKEN = "ATATT3xFfGF0I080ue1C5AOeK9iJgFVtBxqt-_XawcY1onUdH_ifuDq4JtRzWijl2sQrq9Y74R7X-VnSU-3B1l4RFzsWlFSkxkjspy85ttiCNhxNgHSL_e-yxJs0SiuAZZ3QmDpF91ebQhLiF73mvT9nuL5Jnvx6CNrdmNDuQP8uo-gDf0liXJU=6E1BEC79"
-JIRA_PROJECT = "SCRUM"
+JIRA_URL = os.getenv("JIRA_URL")
+JIRA_EMAIL = os.getenv("JIRA_EMAIL")
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+JIRA_PROJECT = os.getenv("JIRA_PROJECT")
 
 
 # ============================================================
