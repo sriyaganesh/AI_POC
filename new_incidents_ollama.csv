@@ -20,3 +20,31 @@ refresh.
 2026-08-20T15:57:11.207326+00:00,INC0000036,4714a2aca9fe198100ecabacf6273482,Issue with networking,Experiencing connection issues. Unable to create connection to data source.,Closed,5 - Planning,2026-03-18 17:33:49,Carol Coughlin,Network,ServiceDesk
 2026-08-20T15:57:11.207326+00:00,INC0000003,e8caedcbc0a80164017df472f39eaed1,Wireless access is down in my area,I just moved from floor 2 to floor 3 and my laptop cannot connect to any wireless network.,In Progress,1 - Critical,2026-03-12 16:07:30,Joe Employee,Network,ServiceDesk
 2026-08-20T15:57:11.207326+00:00,INC0000002,9d385017c611228701d22104cc95c371,Network file shares access issue,User can't get to any of his files on the file server.,On Hold,1 - Critical,2026-03-05 15:07:12,Fred Luddy,Network,ServiceDesk
+2026-08-21T06:55:49.917712+00:00,INC0010025,a30d4c5a933e0f102ef036718bba10ea,Customer records missing from CRM dashboard,Users report that customer records created in the last 24 hours are not visible in the CRM application. Database tables appear to be missing recent entries.,New,4 - Low,2026-08-20 23:48:20,System Administrator,,Jira
+2026-08-21T06:55:49.917712+00:00,INC0010024,3d8c805a933e0f102ef036718bba1033,Request to Reset Password,Password has been expired. Request to Reset Password,New,4 - Low,2026-08-20 23:46:01,System Administrator,,ServiceDesk
+2026-08-21T07:10:34.562798+00:00,INC0010028,2e7f489a933e0f102ef036718bba100c,Data incident Test,Data Incident Test for the POC,New,4 - Low,2026-08-20 23:58:55,System Administrator,POC_DATA,Jira
+2026-08-21T07:10:34.562798+00:00,INC0010027,273fcc9e933e0f102ef036718bba10b4,Customer records missing from CRM Report Dashboard,Users report that customer records created in the last 24 hours are not visible in the CRM application. Database tables appear to be missing recent entries.,New,4 - Low,2026-08-20 23:57:53,System Administrator,,ServiceDesk
+2026-08-21T07:10:34.562798+00:00,INC0010026,bbfec49e933e0f102ef036718bba104e,Monthly sales report showing incorrect revenue figures,Finance team identified discrepancies between transaction records and generated sales reports. Revenue totals are significantly lower than expected.,New,4 - Low,2026-08-20 23:56:49,System Administrator,,Jira
+
+detected_at,number,sys_id,short_description,description,state,priority,opened_at,caller,assignment_group,category
+2026-08-20T07:49:15.111304+00:00,INC0010019,f26987b193768b102ef036718bba10c4,Request to Install VS CODE,Request to Install VS CODE,New,4 - Low,2026-08-20 00:14:20,System Administrator,POC_DATA,Jira
+2026-08-20T15:57:11.207326+00:00,INC0010023,65fe348693f2cb102ef036718bba1039,Sales dashboard showing incorrect revenue figures,"The monthly sales dashboard is displaying revenue values that do not
+match the source transaction data. Several regions are showing lower
+revenue than expected. The underlying transactions are present, but the
+values displayed in the dashboard are incorrect after the latest data
+refresh.
+",New,4 - Low,2026-08-20 08:47:54,System Administrator,,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0010009,a66ffa3d93f28b102ef036718bba1098,Hardware issue,,New,4 - Low,2026-08-19 23:30:38,System Administrator,POC_DATA,Jira
+2026-08-20T15:57:11.207326+00:00,INC0010007,7c1360f193324b102ef036718bba10c3,Test Service Desk,Test Service Desk,New,4 - Low,2026-08-19 12:07:35,System Administrator,,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0010006,12f2e4f193fe0b102ef036718bba1052,Test,Test,New,4 - Low,2026-08-19 12:07:08,System Administrator,,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0010005,84a1e4f593324b102ef036718bba106b,Test Incident 3,Test Incident created for POC,New,4 - Low,2026-08-19 12:01:14,System Administrator,POC_DATA,Jira
+2026-08-20T15:57:11.207326+00:00,INC0010004,a55fdcb193324b102ef036718bba103e,Test POC Incident 2,This is a test incident 2 created for POC,New,4 - Low,2026-08-19 11:51:15,System Administrator,POC_DATA,Jira
+2026-08-20T15:57:11.207326+00:00,INC0010001,1b10f7b0933e83102ef036718bba101c,Test Incident 1,,New,4 - Low,2026-08-17 00:29:29,System Administrator,,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000055,d71f7935c0a8016700802b64c67c11c6,SAP Sales app is not accessible,Unable to get into the SAP Sales app. It was working yesterday.,In Progress,1 - Critical,2026-05-21 21:47:23,Carol Coughlin,Service Desk,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000050,ef43c6d40a0a0b5700c77f9bf387afe3,Can't access Exchange server - is it down?,Can't connect to Exchange. Login credentials and network connection are working though.,In Progress,1 - Critical,2026-05-21 14:58:24,Jerrod Bennett,Hardware,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000049,ef4225a40a0a0b5700d0b8a790747812,Network storage unavailable,"Receiving error message with ""network path not found.""",In Progress,2 - High,2026-05-21 14:56:37,Beth Anglin,Hardware,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000013,46cebb88a9fe198101aee93734f9768b,EMAIL is slow when an attachment is involved,"Noticing today that any time I send an email with an attachment, it takes at least 20 seconds to send. This happens regardless of the attachment size.",Closed,1 - Critical,2026-03-23 16:15:58,Joe Employee,Software,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000038,4717dfe5a9fe198100450448b2404c16,my PDF docs are all locked from editing,Unable to edit any PDFs in Acrobat. All my PDFs are read only now. How do I unlock them?,Closed,4 - Low,2026-03-18 17:36:44,Bow Ruggeri,Service Desk,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000036,4714a2aca9fe198100ecabacf6273482,Issue with networking,Experiencing connection issues. Unable to create connection to data source.,Closed,5 - Planning,2026-03-18 17:33:49,Carol Coughlin,Network,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000003,e8caedcbc0a80164017df472f39eaed1,Wireless access is down in my area,I just moved from floor 2 to floor 3 and my laptop cannot connect to any wireless network.,In Progress,1 - Critical,2026-03-12 16:07:30,Joe Employee,Network,ServiceDesk
+2026-08-20T15:57:11.207326+00:00,INC0000002,9d385017c611228701d22104cc95c371,Network file shares access issue,User can't get to any of his files on the file server.,On Hold,1 - Critical,2026-03-05 15:07:12,Fred Luddy,Network,ServiceDesk
