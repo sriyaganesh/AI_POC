@@ -98,3 +98,34 @@ class JiraClient:
         result = response.json()
         key = result["key"]
         return JiraIssue(key=key, url=f"{self.url}/browse/{key}")
+
+    def find_issue_by_summary_text(self, text: str) -> JiraIssue | None:
+        """
+        Search the configured project for an existing (any status) issue
+        whose summary contains `text` -- e.g. a ServiceNow incident number
+        like "INC0012345" -- and return the most recently created match, or
+        None if none exists.
+
+        Used to avoid creating a duplicate Jira ticket for an incident that
+        was already routed to Jira previously.
+        """
+        jql = f'project = "{self.project}" AND summary ~ "{text}" ORDER BY created DESC'
+        response = requests.get(
+            f"{self.url}/rest/api/3/search/jql",
+            auth=(self.email, self.api_token),
+            headers={"Accept": "application/json"},
+            params={"jql": jql, "maxResults": 1, "fields": "summary"},
+            timeout=self.timeout,
+        )
+
+        if response.status_code != 200:
+            raise JiraAPIError(
+                f"Jira API returned {response.status_code}: {response.text[:500]}"
+            )
+
+        issues = response.json().get("issues") or []
+        if not issues:
+            return None
+
+        key = issues[0]["key"]
+        return JiraIssue(key=key, url=f"{self.url}/browse/{key}")

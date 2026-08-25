@@ -77,20 +77,31 @@ This is the main pipeline. On every poll it:
    - Multiple incidents from the same poll are classified **concurrently**
      (up to 4 parallel Ollama calls) instead of one at a time.
 4. **Routes** every incident classified `Jira`:
-   - Creates a Jira issue (`jira_client.py`, Jira Cloud REST API v3) carrying
-     over the incident number, priority, caller, assignment group, and
-     description.
-   - On success, PATCHes the ServiceNow incident: `state` →
+   - Before creating anything, searches the Jira project for an existing
+     issue whose summary already contains the incident number
+     (`JiraClient.find_issue_by_summary_text()`) and reuses that key instead
+     of creating a duplicate.
+   - Otherwise creates a Jira issue (`jira_client.py`, Jira Cloud REST API
+     v3) carrying over the incident number, priority, caller, assignment
+     group, and description.
+   - Either way, PATCHes the ServiceNow incident: `state` →
      `SERVICENOW_IN_PROGRESS_STATE` (default `2`, In Progress) and adds a
-     work note recording the new Jira key.
+     work note recording the Jira key.
    - Pass `--no-jira` to classify/log only and skip this step entirely.
-5. **Logs** every newly-seen incident (category, matched keywords, Jira key
+5. **Reconciles reverted incidents**: incidents that reappear among "New"
+   results despite already being recorded as seen (e.g. someone accidentally
+   reset a routed incident's state back to New) are checked for an existing
+   Jira ticket via the same summary-text search; if one is found, the
+   ServiceNow state is restored to In Progress with an explanatory work
+   note and no duplicate is created (`reconcile_reverted_incidents()`). This
+   runs whenever `--no-jira` is not set.
+6. **Logs** every newly-seen incident (category, matched keywords, Jira key
    if any) to the output file — `new_incidents_ollama.csv` by default, or
    JSONL with `--format jsonl`.
-6. **Records** every LLM call (model, tokens, latency, success/failure) to
+7. **Records** every LLM call (model, tokens, latency, success/failure) to
    `llm_usage_log.jsonl` and prints a usage summary at the end of each run
    (or on demand via `--usage-summary`).
-7. Optionally **loops forever** on an interval with `--watch --interval N`
+8. Optionally **loops forever** on an interval with `--watch --interval N`
    (e.g. for cron / Windows Task Scheduler you'd instead just run it once
    per invocation).
 
@@ -257,3 +268,10 @@ immediately, bypassing keyword/LLM classification entirely.
 - Both ServiceNow and Jira clients use basic auth (PDI username/password,
   and Jira email + API token respectively), which is what a PDI and Jira
   Cloud support out of the box.
+- `incident_monitor_ollama.py` never creates a duplicate Jira ticket for the
+  same incident: before creating one it searches Jira for an existing issue
+  whose summary contains the incident number, and reuses that key if found.
+  This also covers an incident whose ServiceNow state gets reset back to
+  New after already being routed — the next poll detects it, confirms the
+  existing ticket, and restores the state to In Progress instead of
+  re-routing it.

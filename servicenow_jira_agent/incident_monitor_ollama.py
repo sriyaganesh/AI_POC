@@ -50,6 +50,13 @@ transitioned from New to In Progress (SERVICENOW_IN_PROGRESS_STATE) with a
 work note recording the new Jira key. Pass --no-jira to skip this and only
 classify/log incidents.
 
+If an incident's ServiceNow state is later changed back to New by mistake
+(e.g. accidentally reset by a user) after already being routed, the next
+poll detects it re-appearing among "New" incidents despite already being
+recorded as seen, confirms a Jira ticket already exists for it (without
+creating a duplicate), and restores its ServiceNow state to In Progress
+with an explanatory work note -- see reconcile_reverted_incidents().
+
 Configuration (via environment variables / .env):
     OLLAMA_MODEL                Name of the Ollama model to use (default: "qwen3:4b").
     OLLAMA_BASE_URL             Base URL of the Ollama server (default: "http://localhost:11434").
@@ -534,6 +541,13 @@ def create_jira_ticket(incident: Incident) -> str | None:
     Create a Jira ticket from a ServiceNow incident's details and return its
     key (e.g. "SCRUM-42"), or None if the ticket could not be created.
 
+    Before creating, checks whether a Jira issue already exists for this
+    incident (summary containing its ServiceNow number, e.g. "INC0012345")
+    and reuses that key instead of creating a duplicate -- this guards
+    against re-routing the same incident twice, e.g. if the local state file
+    was reset/lost or the incident was polled again before its ServiceNow
+    state could be updated to In Progress.
+
     Never raises: if Jira isn't configured or the API call fails for any
     reason, this logs a warning and returns None so the poll loop keeps
     running (the incident is left as-is in ServiceNow for a later retry).
@@ -541,6 +555,24 @@ def create_jira_ticket(incident: Incident) -> str | None:
     summary, description = _build_jira_fields(incident)
     try:
         jira = _get_jira_client()
+
+        try:
+            existing = jira.find_issue_by_summary_text(incident.number)
+        except JiraAPIError as e:
+            existing = None
+            print(
+                f"Warning: could not check for an existing Jira ticket for {incident.number} "
+                f"({e}); proceeding to create a new one.",
+                file=sys.stderr,
+            )
+        if existing:
+            print(
+                f"Jira ticket {existing.key} already exists for {incident.number}; "
+                "skipping creation.",
+                file=sys.stderr,
+            )
+            return existing.key
+
         issue = jira.create_issue(summary=summary, description=description, issue_type="Task")
         return issue.key
     except JiraConfigError as e:
@@ -606,6 +638,95 @@ def route_incidents_to_jira(
             )
 
     return jira_keys
+
+
+def reconcile_reverted_incidents(
+    client: ServiceNowClient, incidents: list[Incident]
+) -> dict[str, tuple[str, str]]:
+    """
+    Handle incidents that were already seen in a previous poll (i.e. already
+    processed once) but have come back in this poll's "New" results anyway --
+    this means their ServiceNow state must have been changed back to New by
+    mistake sometime after processing (e.g. a user accidentally reset it),
+    since an incident correctly left In Progress would no longer match a
+    state=New query.
+
+    For each such incident, confirm a Jira ticket already exists for it
+    (matched via its ServiceNow number, same as create_jira_ticket's
+    duplicate check) before touching anything -- no ticket is ever created
+    here. If one exists, the ServiceNow state is restored to In Progress
+    with a work note explaining why; no action is taken otherwise (e.g. the
+    incident was previously classified ServiceDesk and never routed to
+    Jira, so there is nothing to restore).
+
+    Returns the confirmed (incident number, Jira key) per incident (keyed by
+    sys_id) for those whose state was restored; incidents left untouched are
+    absent from the result.
+
+    Never raises: Jira/ServiceNow errors are logged and skipped so the poll
+    loop keeps running.
+    """
+    fixed: dict[str, tuple[str, str]] = {}
+    if not incidents:
+        return fixed
+
+    try:
+        jira = _get_jira_client()
+    except JiraConfigError as e:
+        print(
+            f"Warning: Jira is not configured ({e}); skipping reconciliation of "
+            f"{len(incidents)} incident(s) whose state reverted to New.",
+            file=sys.stderr,
+        )
+        return fixed
+
+    for inc in incidents:
+        try:
+            existing = jira.find_issue_by_summary_text(inc.number)
+        except JiraAPIError as e:
+            print(
+                f"Warning: could not check for an existing Jira ticket for {inc.number} "
+                f"while reconciling its state ({e}); leaving it as-is.",
+                file=sys.stderr,
+            )
+            continue
+
+        if not existing:
+            # No Jira ticket on record for this incident -- it wasn't
+            # previously routed to Jira, so a state of New isn't a mistake.
+            continue
+
+        try:
+            client.update_incident(
+                inc.sys_id,
+                {
+                    "state": IN_PROGRESS_INCIDENT_STATE,
+                    "work_notes": (
+                        f"State was found reset to New, but Jira ticket {existing.key} "
+                        "already exists for this incident; restoring state to In Progress."
+                    ),
+                },
+            )
+            fixed[inc.sys_id] = (inc.number, existing.key)
+            print(
+                f"Incident {inc.number} was showing as New but Jira ticket {existing.key} "
+                "already exists for it; restored ServiceNow state to In Progress.",
+                file=sys.stderr,
+            )
+        except ServiceNowAPIError as e:
+            print(
+                f"Warning: found existing Jira ticket {existing.key} for {inc.number}, but "
+                f"failed to restore its ServiceNow state to In Progress ({e}).",
+                file=sys.stderr,
+            )
+        except Exception as e:  # noqa: BLE001 - never let ServiceNow issues break monitoring
+            print(
+                f"Warning: found existing Jira ticket {existing.key} for {inc.number}, but an "
+                f"unexpected error occurred restoring its ServiceNow state ({e}).",
+                file=sys.stderr,
+            )
+
+    return fixed
 
 
 def load_state(state_path: Path) -> dict:
@@ -686,7 +807,12 @@ def poll_once(
     new_state: str | None = NEW_INCIDENT_STATE,
     keywords_path: Path = DEFAULT_KEYWORDS_FILE,
     route_to_jira: bool = True,
-) -> tuple[list[Incident], dict[str, tuple[str, list[str]]], dict[str, str]]:
+) -> tuple[
+    list[Incident],
+    dict[str, tuple[str, list[str]]],
+    dict[str, str],
+    dict[str, tuple[str, str]],
+]:
     """
     Fetch only newly-created incidents (ServiceNow state == new_state, e.g.
     "New"), diff against previously-seen sys_ids, classify them, route any
@@ -694,10 +820,17 @@ def poll_once(
     In Progress -- see route_incidents_to_jira), write any new ones to the
     output file, and update state in place.
 
+    Incidents that reappear in this poll despite already being in the
+    seen-sys_ids state (i.e. their ServiceNow state must have been changed
+    back to new_state by mistake after already being processed) are handled
+    separately: see reconcile_reverted_incidents().
+
     Returns the list of newly detected incidents, their
-    (category, matched_keywords) (keyed by sys_id), and the Jira key created
-    per sys_id (only present for incidents successfully routed to Jira), so
-    callers don't need to re-classify or re-route them.
+    (category, matched_keywords) (keyed by sys_id), the Jira key created per
+    sys_id (only present for incidents successfully routed to Jira), and the
+    confirmed Jira key per sys_id for incidents whose reverted state was
+    restored to In Progress -- so callers don't need to re-classify or
+    re-route them.
     """
 
     incidents = client.list_incidents(
@@ -708,6 +841,7 @@ def poll_once(
     is_baseline_run = not state.get("initialized", False)
 
     new_incidents = [inc for inc in incidents if inc.sys_id and inc.sys_id not in seen]
+    reverted_incidents = [inc for inc in incidents if inc.sys_id and inc.sys_id in seen]
 
     if is_baseline_run:
         # First run: record everything currently there as the baseline.
@@ -731,12 +865,16 @@ def poll_once(
     else:
         categories = {}
 
+    reconciled_keys: dict[str, tuple[str, str]] = {}
+    if reverted_incidents and route_to_jira:
+        reconciled_keys = reconcile_reverted_incidents(client, reverted_incidents)
+
     # Update seen set, bounded so the state file doesn't grow forever.
     all_ids = list(seen.union(inc.sys_id for inc in incidents if inc.sys_id))
     state["seen_sys_ids"] = all_ids[-2000:]
     state["last_checked"] = datetime.now(timezone.utc).isoformat()
 
-    return written, categories, jira_keys
+    return written, categories, jira_keys, reconciled_keys
 
 
 def build_client() -> ServiceNowClient:
@@ -841,7 +979,7 @@ def main() -> None:
 
     def run_once() -> None:
         try:
-            new_incidents, categories, jira_keys = poll_once(
+            new_incidents, categories, jira_keys, reconciled_keys = poll_once(
                 client,
                 args.output,
                 state,
@@ -857,6 +995,15 @@ def main() -> None:
             return
         finally:
             save_state(args.state, state)
+
+        if reconciled_keys:
+            print(
+                f"[{datetime.now(timezone.utc).isoformat()}] "
+                f"{len(reconciled_keys)} incident(s) had reverted to New by mistake and were "
+                "restored to In Progress (existing Jira ticket confirmed):"
+            )
+            for number, jira_key in reconciled_keys.values():
+                print(f"  - {number} -> Jira {jira_key}")
 
         if new_incidents:
             print(
