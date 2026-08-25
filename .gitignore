@@ -10,5 +10,9 @@ venv/
 
 # Runtime / generated data
 .incident_monitor_state.json
+.incident_monitor_ollama_state.json
 new_incidents.csv
+new_incidents_ollama.csv
+*.log
+*.jsonl
 .env

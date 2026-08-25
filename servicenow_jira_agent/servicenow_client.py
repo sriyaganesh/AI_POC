@@ -138,3 +138,24 @@ class ServiceNowClient:
 
         records = response.json().get("result", [])
         return [Incident.from_record(r) for r in records]
+
+    def update_incident(self, sys_id: str, fields: dict[str, Any]) -> None:
+        """
+        Update fields on an existing incident record, e.g. to transition its
+        state (see incident_monitor_ollama.IN_PROGRESS_INCIDENT_STATE) or
+        append a work note referencing a Jira ticket.
+        """
+        url = f"{self.base_url}/api/now/table/incident/{sys_id}"
+
+        response = requests.patch(
+            url,
+            auth=(self.username, self.password),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json=fields,
+            timeout=self.timeout,
+        )
+
+        if response.status_code not in (200, 201):
+            raise ServiceNowAPIError(
+                f"ServiceNow API returned {response.status_code}: {response.text[:500]}"
+            )

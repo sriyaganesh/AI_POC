@@ -1,0 +1,145 @@
+# ============================================================================
+#  Data-Related Keywords Configuration
+# ============================================================================
+#  This file tells the incident monitor which words/phrases indicate that an
+#  incident is DATA-related (and should therefore be routed toward Jira
+#  instead of the general ServiceDesk queue). This includes general data
+#  terms as well as the names of specific data/ETL tools and platforms
+#  (Informatica, Talend, Airflow, Snowflake, Power BI, etc.).
+#
+#  These keywords are used together with the AI model: a match here is given
+#  to the AI as supporting evidence, and the AI makes the final Jira /
+#  ServiceDesk decision by reading the full incident text. If NONE of these
+#  keywords match, the AI still reads the full description and decides for
+#  itself based on its own understanding -- an incident isn't forced to
+#  ServiceDesk just because it doesn't happen to mention a listed word.
+#
+#  HOW TO EDIT (no coding needed):
+#    - One keyword or short phrase per line, starting with a dash and a space
+#      ("- like this").
+#    - Matching is NOT case-sensitive: "Data", "DATA" and "data" all match.
+#    - Keep entries short and specific (e.g. "duplicate data" rather than a
+#      full sentence) so they reliably match real incident text.
+#    - Lines starting with "#" are comments/notes and are ignored.
+#    - Save the file after editing. Changes are picked up automatically on
+#      the monitor's next poll -- no restart or code change required.
+# ============================================================================
+
+keywords:
+  # --- General data terms ---
+  - data
+  - dataset
+  - database
+  - data set
+
+  # --- Data quality problems ---
+  - data quality
+  - incorrect data
+  - inaccurate data
+  - missing data
+  - duplicate data
+  - corrupted data
+  - stale data
+  - inconsistent data
+  - data mismatch
+  - bad data
+  - data discrepancy
+  - null values
+  - blank values
+
+  # --- Pipelines, feeds, integrations ---
+  - etl
+  - data pipeline
+  - data feed
+  - data sync
+  - data synchronization
+  - data load
+  - data ingestion
+  - data migration
+  - data mapping
+  - data transformation
+  - data integration
+  - extract transform load
+  - data extract
+
+  # --- Storage / warehouse ---
+  - data warehouse
+  - warehouse load
+  - data lake
+  - table load
+  - schema
+
+  # --- Reporting / analytics ---
+  - report
+  - reporting
+  - dashboard
+  - reconciliation
+  - data integrity
+  - analytics
+  - kpi mismatch
+
+  # --- ETL / data integration tools ---
+  - informatica
+  - powercenter
+  - talend
+  - ssis
+  - sql server integration services
+  - azure data factory
+  - data factory
+  - aws glue
+  - matillion
+  - fivetran
+  - stitch
+  - airbyte
+  - mulesoft
+  - dataflow
+  - dataproc
+  - nifi
+  - apache nifi
+
+  # --- Workflow / orchestration tools ---
+  - airflow
+  - apache airflow
+  - dbt
+  - control-m
+  - autosys
+
+  # --- Big data / processing platforms ---
+  - spark
+  - apache spark
+  - databricks
+  - hadoop
+  - hive
+  - kafka
+  - apache kafka
+  - emr
+
+  # --- Data warehouse / database platforms ---
+  - snowflake
+  - redshift
+  - bigquery
+  - synapse
+  - azure synapse
+  - teradata
+  - sql server
+  - oracle database
+  - postgresql
+  - mysql
+  - mongodb
+
+  # --- BI / reporting tools ---
+  - power bi
+  - tableau
+  - qlik
+  - qlikview
+  - qliksense
+  - looker
+  - ssrs
+  - cognos
+  - microstrategy
+  - sap bw
+  - alteryx
+  - sas
+
+  # --- Add your own below ---
+  # - your keyword here
