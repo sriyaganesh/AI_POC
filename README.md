@@ -85,16 +85,17 @@ This is the main pipeline. On every poll it:
      v3) carrying over the incident number, priority, caller, assignment
      group, and description.
    - Either way, PATCHes the ServiceNow incident: `state` →
-     `SERVICENOW_IN_PROGRESS_STATE` (default `2`, In Progress) and adds a
-     work note recording the Jira key.
+     `SERVICENOW_IN_PROGRESS_STATE` (default `2`, In Progress), `assignment_group`
+     → `POC_DATA`, and adds a work note recording the Jira key.
    - Pass `--no-jira` to classify/log only and skip this step entirely.
 5. **Reconciles reverted incidents**: incidents that reappear among "New"
    results despite already being recorded as seen (e.g. someone accidentally
    reset a routed incident's state back to New) are checked for an existing
    Jira ticket via the same summary-text search; if one is found, the
-   ServiceNow state is restored to In Progress with an explanatory work
-   note and no duplicate is created (`reconcile_reverted_incidents()`). This
-   runs whenever `--no-jira` is not set.
+   ServiceNow state is restored to In Progress, `assignment_group` is reset
+   to `POC_DATA`, and an explanatory work note is added — no duplicate is
+   created (`reconcile_reverted_incidents()`). This runs whenever `--no-jira`
+   is not set.
 6. **Logs** every newly-seen incident (category, matched keywords, Jira key
    if any) to the output file — `new_incidents_ollama.csv` by default, or
    JSONL with `--format jsonl`.
