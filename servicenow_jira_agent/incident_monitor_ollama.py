@@ -621,6 +621,7 @@ def route_incidents_to_jira(
                 inc.sys_id,
                 {
                     "state": IN_PROGRESS_INCIDENT_STATE,
+                    "assignment_group": JIRA_ASSIGNMENT_GROUP,
                     "work_notes": f"Routed to Jira ticket {jira_key} by incident_monitor_ollama.",
                 },
             )
@@ -701,6 +702,7 @@ def reconcile_reverted_incidents(
                 inc.sys_id,
                 {
                     "state": IN_PROGRESS_INCIDENT_STATE,
+                    "assignment_group": JIRA_ASSIGNMENT_GROUP,
                     "work_notes": (
                         f"State was found reset to New, but Jira ticket {existing.key} "
                         "already exists for this incident; restoring state to In Progress."
