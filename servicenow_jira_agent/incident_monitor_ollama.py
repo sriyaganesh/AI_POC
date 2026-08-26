@@ -25,6 +25,14 @@ NEW_INCIDENT_STATE / --state below. Incidents already picked up in a
 previous poll are additionally filtered out locally via the state file, so
 none are ever written to the output file twice.
 
+Polling is incremental: after the baseline poll, each poll asks ServiceNow
+only for incidents opened at/after the cursor recorded in the state file
+(state["last_opened_at"]), rather than re-fetching and re-diffing the same
+--limit newest incidents every time. Every --full-sweep-interval-th poll
+instead does a full re-fetch, which is what catches an incident whose state
+was reset back to New after already being processed (see
+reconcile_reverted_incidents() below) -- see --full-sweep-interval.
+
 On the very first run (no state file yet) the currently existing incidents
 are recorded as a baseline but NOT written to the output file, so the output
 file only ever contains incidents created after monitoring started. Pass
@@ -118,6 +126,10 @@ DEFAULT_KEYWORDS_FILE = Path(
 # Assignment group (case/spacing-insensitive) that routes an incident to Jira
 # instead of ServiceDesk.
 JIRA_ASSIGNMENT_GROUP = "POC_DATA"
+
+# Assignment group that incidents classified as "ServiceDesk" are assigned to
+# in ServiceNow (see route_incidents_to_servicedesk()).
+SERVICE_DESK_ASSIGNMENT_GROUP = "POC_SERVICE_DESK_SUPPORT"
 
 CSV_FIELDS = [
     "detected_at",
@@ -641,6 +653,57 @@ def route_incidents_to_jira(
     return jira_keys
 
 
+def route_incidents_to_servicedesk(
+    client: ServiceNowClient,
+    incidents: list[Incident],
+    categories: dict[str, tuple[str, list[str]]],
+) -> list[str]:
+    """
+    For every incident classified as "ServiceDesk", assign the ServiceNow
+    incident to SERVICE_DESK_ASSIGNMENT_GROUP (POC_SERVICE_DESK_SUPPORT) with
+    a work note recording the automatic classification.
+
+    Returns the sys_ids of incidents successfully updated; incidents that
+    aren't classified as "ServiceDesk", or for which the ServiceNow update
+    failed, are simply absent from the result.
+
+    Never raises: ServiceNow errors are logged and skipped so the poll loop
+    keeps running.
+    """
+    updated: list[str] = []
+    for inc in incidents:
+        category, _matched = categories.get(inc.sys_id, ("ServiceDesk", []))
+        if category != "ServiceDesk":
+            continue
+
+        try:
+            client.update_incident(
+                inc.sys_id,
+                {
+                    "assignment_group": SERVICE_DESK_ASSIGNMENT_GROUP,
+                    "work_notes": (
+                        "Classified as ServiceDesk by incident_monitor_ollama; "
+                        f"assigned to {SERVICE_DESK_ASSIGNMENT_GROUP}."
+                    ),
+                },
+            )
+            updated.append(inc.sys_id)
+        except ServiceNowAPIError as e:
+            print(
+                f"Warning: failed to assign {inc.number} to "
+                f"{SERVICE_DESK_ASSIGNMENT_GROUP} ({e}).",
+                file=sys.stderr,
+            )
+        except Exception as e:  # noqa: BLE001 - never let ServiceNow issues break monitoring
+            print(
+                f"Warning: unexpected error assigning {inc.number} to "
+                f"{SERVICE_DESK_ASSIGNMENT_GROUP} ({e}).",
+                file=sys.stderr,
+            )
+
+    return updated
+
+
 def reconcile_reverted_incidents(
     client: ServiceNowClient, incidents: list[Incident]
 ) -> dict[str, tuple[str, str]]:
@@ -799,6 +862,36 @@ def append_incidents(
     return categories
 
 
+# ServiceNow "opened_at" display-value format (matches sysparm_display_value
+# output, e.g. "2024-01-15 10:30:00"), used to parse the incremental-poll
+# cursor for comparison. If a value doesn't match (unexpected instance
+# format), _max_opened_at() falls back to plain string comparison, which
+# still works correctly as long as the format is consistently zero-padded
+# and left-to-right significant (as ServiceNow's default format is).
+_OPENED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _max_opened_at(current: str | None, incidents: list[Incident]) -> str | None:
+    """
+    Return the latest "opened_at" value among current and every incident in
+    incidents, used to advance the incremental-poll cursor (state's
+    "last_opened_at") to the furthest point the New-state timeline has been
+    swept up to.
+    """
+
+    def _key(value: str):
+        try:
+            return (0, datetime.strptime(value, _OPENED_AT_FORMAT))
+        except ValueError:
+            return (1, value)
+
+    best = current
+    for inc in incidents:
+        if inc.opened_at and (best is None or _key(inc.opened_at) > _key(best)):
+            best = inc.opened_at
+    return best
+
+
 def poll_once(
     client: ServiceNowClient,
     output_path: Path,
@@ -809,38 +902,74 @@ def poll_once(
     new_state: str | None = NEW_INCIDENT_STATE,
     keywords_path: Path = DEFAULT_KEYWORDS_FILE,
     route_to_jira: bool = True,
+    full_sweep_interval: int = 10,
 ) -> tuple[
     list[Incident],
     dict[str, tuple[str, list[str]]],
     dict[str, str],
     dict[str, tuple[str, str]],
+    list[str],
 ]:
     """
-    Fetch only newly-created incidents (ServiceNow state == new_state, e.g.
+    Fetch newly-created incidents (ServiceNow state == new_state, e.g.
     "New"), diff against previously-seen sys_ids, classify them, route any
     "Jira" incidents to Jira (creating a ticket and moving the incident to
-    In Progress -- see route_incidents_to_jira), write any new ones to the
-    output file, and update state in place.
+    In Progress -- see route_incidents_to_jira), assign any "ServiceDesk"
+    incidents to SERVICE_DESK_ASSIGNMENT_GROUP (see
+    route_incidents_to_servicedesk), write any new ones to the output file,
+    and update state in place.
 
-    Incidents that reappear in this poll despite already being in the
-    seen-sys_ids state (i.e. their ServiceNow state must have been changed
-    back to new_state by mistake after already being processed) are handled
-    separately: see reconcile_reverted_incidents().
+    Polling is incremental: once a baseline has been established, each poll
+    queries ServiceNow only for incidents opened at/after the cursor
+    recorded in state["last_opened_at"] (the furthest point already swept),
+    instead of re-fetching and re-diffing the same top `limit` newest
+    incidents every time. This means a poll's cost no longer depends on how
+    many incidents have already been seen, and a burst of more than `limit`
+    new incidents between polls is never silently dropped -- the cursor only
+    advances past what was actually fetched.
+
+    Because an incremental poll only looks at incidents opened after the
+    cursor, it cannot see an older incident whose state was reset back to
+    new_state after already being processed (see
+    reconcile_reverted_incidents() below). To still catch that, every
+    full_sweep_interval-th poll (and always the first, baseline poll) instead
+    does a full, non-incremental fetch of every current new_state incident
+    (as before), which both re-establishes the cursor and re-surfaces any
+    reverted incidents for reconciliation. Pass full_sweep_interval=1 to do a
+    full sweep on every poll (disables the incremental optimization); pass 0
+    to never sweep again after the baseline (fastest, but reverted incidents
+    older than the incremental window would no longer be caught).
 
     Returns the list of newly detected incidents, their
     (category, matched_keywords) (keyed by sys_id), the Jira key created per
-    sys_id (only present for incidents successfully routed to Jira), and the
+    sys_id (only present for incidents successfully routed to Jira), the
     confirmed Jira key per sys_id for incidents whose reverted state was
-    restored to In Progress -- so callers don't need to re-classify or
+    restored to In Progress, and the sys_ids of incidents assigned to
+    SERVICE_DESK_ASSIGNMENT_GROUP -- so callers don't need to re-classify or
     re-route them.
     """
 
-    incidents = client.list_incidents(
-        limit=limit, order_by_newest=True, state=new_state
+    cursor = state.get("last_opened_at")
+    is_baseline_run = not state.get("initialized", False)
+    polls_since_sweep = state.get("polls_since_full_sweep", 0)
+    do_full_sweep = (
+        is_baseline_run
+        or cursor is None
+        or full_sweep_interval == 1
+        or (full_sweep_interval > 1 and polls_since_sweep + 1 >= full_sweep_interval)
     )
 
+    incidents = client.list_incidents(
+        limit=limit,
+        order_by_newest=True,
+        state=new_state,
+        query=None if do_full_sweep else f"opened_at>={cursor}",
+    )
+
+    state["polls_since_full_sweep"] = 0 if do_full_sweep else polls_since_sweep + 1
+    state["last_opened_at"] = _max_opened_at(cursor, incidents)
+
     seen: set[str] = set(state.get("seen_sys_ids", []))
-    is_baseline_run = not state.get("initialized", False)
 
     new_incidents = [inc for inc in incidents if inc.sys_id and inc.sys_id not in seen]
     reverted_incidents = [inc for inc in incidents if inc.sys_id and inc.sys_id in seen]
@@ -859,10 +988,12 @@ def poll_once(
     keywords = load_data_keywords(keywords_path)
 
     jira_keys: dict[str, str] = {}
+    servicedesk_assigned: list[str] = []
     if written:
         categories = categorize_incidents(written, keywords)
         if route_to_jira:
             jira_keys = route_incidents_to_jira(client, written, categories)
+            servicedesk_assigned = route_incidents_to_servicedesk(client, written, categories)
         append_incidents(output_path, written, fmt, keywords, categories, jira_keys)
     else:
         categories = {}
@@ -876,7 +1007,7 @@ def poll_once(
     state["seen_sys_ids"] = all_ids[-2000:]
     state["last_checked"] = datetime.now(timezone.utc).isoformat()
 
-    return written, categories, jira_keys, reconciled_keys
+    return written, categories, jira_keys, reconciled_keys, servicedesk_assigned
 
 
 def build_client() -> ServiceNowClient:
@@ -949,6 +1080,17 @@ def main() -> None:
         help="Poll incidents in any state instead of only newly-created ones.",
     )
     parser.add_argument(
+        "--full-sweep-interval",
+        type=int,
+        default=10,
+        help="After the baseline poll, do a full (non-incremental) re-fetch of every "
+        "current incident -- needed to catch incidents reverted back to New after "
+        "already being processed, see reconcile_reverted_incidents() -- every Nth "
+        "poll; other polls fetch incrementally (only incidents opened since the "
+        "last poll). Use 1 to full-sweep every poll (disables the incremental "
+        "optimization), or 0 to never sweep again after the baseline (default: 10).",
+    )
+    parser.add_argument(
         "--usage-summary",
         action="store_true",
         help="Print a summary of all LLM calls logged so far (tokens used, "
@@ -981,7 +1123,7 @@ def main() -> None:
 
     def run_once() -> None:
         try:
-            new_incidents, categories, jira_keys, reconciled_keys = poll_once(
+            new_incidents, categories, jira_keys, reconciled_keys, servicedesk_assigned = poll_once(
                 client,
                 args.output,
                 state,
@@ -991,6 +1133,7 @@ def main() -> None:
                 new_state,
                 args.keywords,
                 not args.no_jira,
+                args.full_sweep_interval,
             )
         except ServiceNowAPIError as e:
             print(f"ServiceNow API error: {e}", file=sys.stderr)
@@ -1021,10 +1164,15 @@ def main() -> None:
                     if jira_key
                     else ""
                 )
+                servicedesk_note = (
+                    f" -> assigned to {SERVICE_DESK_ASSIGNMENT_GROUP}"
+                    if inc.sys_id in servicedesk_assigned
+                    else ""
+                )
                 print(
                     f"  - {inc.number}: {inc.short_description or '(no description)'} "
                     f"[group={inc.assignment_group or 'n/a'} -> category={category}{keyword_note}]"
-                    f"{jira_note}"
+                    f"{jira_note}{servicedesk_note}"
                 )
         else:
             print(f"[{datetime.now(timezone.utc).isoformat()}] No new incidents.")
