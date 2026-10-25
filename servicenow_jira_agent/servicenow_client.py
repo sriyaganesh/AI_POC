@@ -139,11 +139,38 @@ class ServiceNowClient:
         records = response.json().get("result", [])
         return [Incident.from_record(r) for r in records]
 
-    def update_incident(self, sys_id: str, fields: dict[str, Any]) -> None:
+    def find_group_sys_id(self, name: str) -> str | None:
+        """
+        Look up an assignment group (sys_user_group) by exact name and return
+        its sys_id, or None if no group matches -- including when the API
+        user lacks read access to sys_user_group, which ServiceNow reports
+        as an empty result rather than an error.
+        """
+        response = requests.get(
+            f"{self.base_url}/api/now/table/sys_user_group",
+            auth=(self.username, self.password),
+            headers={"Accept": "application/json"},
+            params={"sysparm_query": f"name={name}", "sysparm_fields": "sys_id", "sysparm_limit": 1},
+            timeout=self.timeout,
+        )
+
+        if response.status_code != 200:
+            raise ServiceNowAPIError(
+                f"ServiceNow API returned {response.status_code}: {response.text[:500]}"
+            )
+
+        records = response.json().get("result", [])
+        return records[0]["sys_id"] if records else None
+
+    def update_incident(self, sys_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         """
         Update fields on an existing incident record, e.g. to transition its
         state (see incident_monitor_ollama.IN_PROGRESS_INCIDENT_STATE) or
         append a work note referencing a Jira ticket.
+
+        Returns the updated record (raw values) as ServiceNow saved it. Note
+        that ServiceNow silently ignores fields the API user isn't allowed
+        to write instead of failing, so callers should check the result.
         """
         url = f"{self.base_url}/api/now/table/incident/{sys_id}"
 
@@ -159,3 +186,5 @@ class ServiceNowClient:
             raise ServiceNowAPIError(
                 f"ServiceNow API returned {response.status_code}: {response.text[:500]}"
             )
+
+        return response.json().get("result", {})

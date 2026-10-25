@@ -1,278 +1,402 @@
 # ServiceNow ↔ Jira Incident Agent
 
-Two complementary tools built on top of a shared ServiceNow client:
+This project watches a ServiceNow PDI (Personal Developer Instance) for new
+incidents. For each one it decides whether it is a **data issue** or a
+**general IT issue**, then routes it automatically:
 
-1. **`agent.py`** — a LangChain + OpenAI conversational agent you can ask
-   natural-language questions about incidents in a ServiceNow PDI
-   (Personal Developer Instance).
-2. **`incident_monitor_ollama.py`** — an unattended poller that watches
-   ServiceNow for newly created incidents, classifies each one as a
-   **data issue** or a **general IT issue** using a locally-hosted Ollama
-   model, and automatically **creates a Jira ticket** for the data issues
-   (transitioning the ServiceNow incident to "In Progress" once routed).
+| Classification | What happens in Jira | What happens in ServiceNow |
+|---|---|---|
+| **Jira** (data issue) | A Jira **Task** is created and **assigned to `sglearn`** | State → **In Progress**, assignment group → `POC_DATA`, work note with the Jira key |
+| **ServiceDesk** (general issue) | Nothing | Assignment group → `ServiceDesk`, work note |
 
-   An older, simpler variant, **`incident_monitor.py`**, does the same
-   polling/logging but classifies with OpenAI instead of Ollama and does
-   not create Jira tickets — kept for reference/comparison.
+Everything lives in the `servicenow_jira_agent` Python package. It contains
+three runnable tools:
 
-Everything lives in the `servicenow_jira_agent` package.
+| Tool | Purpose | LLM used |
+|---|---|---|
+| `incident_monitor_ollama.py` | **Main pipeline**: poll → classify → route to Jira / ServiceDesk → log | Local Ollama (`qwen3:4b` by default) |
+| `agent.py` | Ask questions about incidents in plain English (read-only) | OpenAI (`gpt-4o-mini` by default) |
+| `incident_monitor.py` | Older version of the monitor: poll → classify → log only, with no Jira or ServiceNow updates. Kept for reference | OpenAI |
 
-## Architecture
+---
 
-```
-servicenow_jira_agent/
-  servicenow_client.py       # REST client for the ServiceNow Table API (incident table)
-  jira_client.py             # REST client for the Jira Cloud API (issue creation)
-  tools.py                   # LangChain @tool wrapping the ServiceNow client, for agent.py
-  agent.py                   # Interactive/one-shot Q&A agent (OpenAI LLM + tool)
-  incident_monitor.py        # Poll -> classify (OpenAI) -> log to CSV/JSONL
-  incident_monitor_ollama.py # Poll -> classify (Ollama) -> route to Jira -> log
-  data_keywords.yaml         # Editable keyword list used as classification hints
-  llm_usage_tracker.py       # Logs tokens/latency/outcome for every LLM call
-```
+## Part A — How an incident is processed (step by step)
 
-### 1. The Q&A agent (`agent.py`)
+This is what `incident_monitor_ollama.py` does on **every poll**.
 
-```
-user instruction
-   -> OpenAI model (LangChain create_agent) decides whether to call the
-      "list_servicenow_incidents" tool
-   -> tool hits GET /api/now/table/incident on your PDI (servicenow_client.py)
-   -> each returned incident is also tagged Jira/ServiceDesk for context
-      (categorize_incident() from incident_monitor.py)
-   -> results go back to the model
-   -> model writes a natural-language summary (table/bullets) for the user
-```
+### Step 1 — Fetch "New" incidents from ServiceNow
+- Calls `GET https://<instance>.service-now.com/api/now/table/incident`
+  with `state=1` (New, configurable through `SERVICENOW_NEW_STATE`), newest first,
+  up to `--limit` records (default `50`).
+- **Polling is incremental.** After the first run, each poll fetches only incidents
+  whose `opened_at` is at or after the cursor saved in the state file
+  (`last_opened_at`).
+- **Full sweep:** every 10th poll (`--full-sweep-interval`, default `10`)
+  re-fetches every incident that is currently New. This is how incidents that
+  were reset back to New get caught (see Step 7).
 
-Run it interactively or with a single instruction (see [Usage](#usage) below).
-It only reads data — it never modifies ServiceNow or creates Jira tickets.
+### Step 2 — Skip incidents that were already processed
+- The sys_ids already seen are stored in `.incident_monitor_ollama_state.json`.
+  The file keeps the last 2,000 sys_ids.
+- **First run only:** the incidents that exist when you first start are
+  recorded as a *baseline* and are **not** processed. Only incidents created
+  after that point are routed. To process the baseline incidents too, pass
+  `--include-existing`.
 
-### 2. The incident monitor / auto-router (`incident_monitor_ollama.py`)
+### Step 3 — Classify each new incident as `Jira` or `ServiceDesk`
+The checks below run in this order:
+1. **Assignment-group shortcut.** If the incident's assignment group is
+   already `POC_DATA` (matched case-insensitively, with spaces treated as underscores),
+   the incident is classified **Jira** straight away. No LLM call is made.
+2. **Keyword hint.** The short description and description are compared
+   against `servicenow_jira_agent/data_keywords.yaml`. Matching is a
+   case-insensitive substring match. The keywords cover general data terms
+   and ETL/BI tool names such as Informatica, Airflow, Snowflake and Power BI.
+3. **LLM decision.** The incident text and the keyword hint are sent to the
+   local Ollama model, which answers exactly `JIRA` or `SERVICEDESK`. The
+   keyword hint is supporting evidence only:
+   - "database server is unreachable" can still be classified ServiceDesk
+     (it is an infrastructure problem).
+   - A data issue that matches no keyword can still be classified Jira.
+- Several incidents are classified in parallel, up to
+  `OLLAMA_MAX_CONCURRENT_CALLS` at a time (default `2`).
+- If the LLM call fails or times out (default `180` seconds), the incident
+  defaults to **ServiceDesk**.
 
-This is the main pipeline. On every poll it:
+### Step 4 — Route "Jira" incidents
+For each incident classified **Jira**:
+1. **Duplicate check.** Jira is searched with
+   `project = "<JIRA_PROJECT>" AND summary ~ "<INC number>"`. If an issue is
+   found, its key is reused and **no new ticket is created**.
+2. **Create the Jira ticket.** The ticket is created as a **Task** in `JIRA_PROJECT`:
+   - **Summary:** `[INC0012345] <short description>`
+   - **Description:** ServiceNow number, priority, caller, assignment group,
+     opened-at time and the full description.
+   - **Priority:** mapped from ServiceNow priority:
 
-1. **Fetches** incidents from ServiceNow that are still in the "New" state
-   (`SERVICENOW_NEW_STATE`, default `1`) — i.e. not yet actioned by anyone.
-2. **Diffs** them against a local state file so nothing is processed twice
-   (`.incident_monitor_ollama_state.json`, gitignored). The very first run
-   just records a baseline and writes nothing (unless `--include-existing`),
-   so the output file only ever contains incidents opened *after* monitoring
-   started.
-3. **Classifies** each new incident as `Jira` (data issue) or `ServiceDesk`
-   (general issue), in this order:
-   - **Assignment group short-circuit**: if the incident's assignment group
-     is `POC_DATA`, it's `Jira` immediately — no LLM call needed.
-   - **Keyword hint**: otherwise, the short description + description are
-     checked against the editable keyword list in `data_keywords.yaml`
-     (general data terms plus ETL/BI/warehouse tool names — Informatica,
-     Airflow, Snowflake, Power BI, dbt, etc.). This is a hint, not a
-     verdict.
-   - **LLM judgement**: the full incident text, plus the keyword hint (if
-     any), is sent to a local Ollama model (`OLLAMA_MODEL`, default
-     `qwen3:4b`) with a system prompt instructing it to always read the
-     actual text rather than defaulting off the keyword match (e.g. "the
-     database server is unreachable" is infrastructure, not a data issue,
-     even though "database" matched). The model answers exactly `JIRA` or
-     `SERVICEDESK`.
-   - Multiple incidents from the same poll are classified **concurrently**
-     (up to 4 parallel Ollama calls) instead of one at a time.
-4. **Routes** every incident classified `Jira`:
-   - Before creating anything, searches the Jira project for an existing
-     issue whose summary already contains the incident number
-     (`JiraClient.find_issue_by_summary_text()`) and reuses that key instead
-     of creating a duplicate.
-   - Otherwise creates a Jira issue (`jira_client.py`, Jira Cloud REST API
-     v3) carrying over the incident number, priority, caller, assignment
-     group, and description.
-   - Either way, PATCHes the ServiceNow incident: `state` →
-     `SERVICENOW_IN_PROGRESS_STATE` (default `2`, In Progress), `assignment_group`
-     → `POC_DATA`, and adds a work note recording the Jira key.
-   - Pass `--no-jira` to classify/log only and skip this step entirely.
-5. **Reconciles reverted incidents**: incidents that reappear among "New"
-   results despite already being recorded as seen (e.g. someone accidentally
-   reset a routed incident's state back to New) are checked for an existing
-   Jira ticket via the same summary-text search; if one is found, the
-   ServiceNow state is restored to In Progress, `assignment_group` is reset
-   to `POC_DATA`, and an explanatory work note is added — no duplicate is
-   created (`reconcile_reverted_incidents()`). This runs whenever `--no-jira`
-   is not set.
-6. **Logs** every newly-seen incident (category, matched keywords, Jira key
-   if any) to the output file — `new_incidents_ollama.csv` by default, or
-   JSONL with `--format jsonl`.
-7. **Records** every LLM call (model, tokens, latency, success/failure) to
-   `llm_usage_log.jsonl` and prints a usage summary at the end of each run
-   (or on demand via `--usage-summary`).
-8. Optionally **loops forever** on an interval with `--watch --interval N`
-   (e.g. for cron / Windows Task Scheduler you'd instead just run it once
-   per invocation).
+     | ServiceNow | Jira |
+     |---|---|
+     | 1 - Critical | Highest |
+     | 2 - High | High |
+     | 3 - Moderate | Medium |
+     | 4 - Low | Low |
+     | 5 - Planning | Lowest |
 
-Any failure in a single step (Ollama unreachable, Jira misconfigured, a
-ServiceNow update failing) is caught, logged as a warning, and does **not**
-stop the poll loop — classification falls back to `ServiceDesk` and routing
-is simply skipped for that incident so it can be retried on a later poll.
+     If Jira rejects the priority value, the ticket is created again
+     once without a priority.
+3. **Assign the ticket to `sglearn`.**
+   - Jira Cloud identifies users by account ID, not username. The monitor
+     looks up the account ID of `JIRA_ASSIGNEE` (default `sglearn`) once,
+     using `GET /rest/api/3/user/search`, and caches it.
+   - It then calls `PUT /rest/api/3/issue/<KEY>/assignee`.
+   - If the assignment fails, a warning is logged and the ticket stays
+     unassigned. The incident still moves on to the next step.
+   - Only **newly created** tickets are assigned. A reused existing ticket
+     keeps its current assignee.
+4. **Move the ServiceNow incident to In Progress.** This is
+   `PATCH /api/now/table/incident/<sys_id>` with:
+   - `state` = `2` (In Progress, configurable through `SERVICENOW_IN_PROGRESS_STATE`)
+   - `assignment_group` = `POC_DATA`
+   - `work_notes` = `Routed to Jira ticket <KEY> by incident_monitor_ollama.`
 
-## 1. Get your PDI details
+If the Jira ticket can't be created, the incident is **left as New** and
+nothing else happens to it.
 
-1. Sign up / log in at https://developer.servicenow.com and request a PDI if
-   you don't already have one.
-2. Note the instance name from the URL, e.g. `https://dev12345.service-now.com`
-   → instance is `dev12345`.
-3. Use your PDI admin username/password (or create a dedicated integration
-   user with the `itil` role, which can read/update the incident table).
+### Step 5 — Route "ServiceDesk" incidents
+Every incident that is **not** classified Jira is classified **ServiceDesk**.
+This includes incidents where the LLM call failed. Each one is updated in
+ServiceNow with:
+- `assignment_group` = `ServiceDesk`
+- a work note recording the classification.
 
-## 2. Get your Jira details (only needed for `incident_monitor_ollama.py`)
+Its **state is not changed**.
 
-1. In Jira Cloud, create (or pick) the project data incidents should land in
-   and note its **project key** (e.g. `SCRUM`).
-2. Create an API token at https://id.atlassian.com/manage-profile/security/api-tokens.
-3. Your Jira site URL is `https://<your-site>.atlassian.net`.
+> **How groups are set (Steps 4 and 5):** the group name is first converted
+> to the group's sys_id, either looked up in `sys_user_group` or taken from
+> the `SERVICENOW_*_GROUP_SYS_ID` override. After each update, the monitor
+> reads back the saved `state` and `assignment_group` and prints a warning
+> if ServiceNow didn't apply them.
 
-## 3. Set up Ollama (only needed for `incident_monitor_ollama.py`)
+### Step 6 — Write each incident to the output file
+Every processed incident is appended to `new_incidents_ollama.csv`, or to a
+JSONL file with `--format jsonl`. The columns are:
+`detected_at, number, sys_id, short_description, description, state,
+priority, opened_at, caller, assignment_group, category, matched_keywords,
+jira_key`.
 
-1. Install Ollama from https://ollama.com and make sure it's running.
-2. Pull the model you want to classify with, e.g.:
-   ```bash
-   ollama pull qwen3:4b
-   ```
+### Step 7 — Fix incidents that were reset to New by mistake
+- An incident that was already processed but shows up as New again was most
+  likely reset by someone.
+- The monitor looks for its existing Jira ticket (same summary search as Step 4).
+- If a ticket is found, the incident is set back to **In Progress** and
+  `POC_DATA`, with an explanatory work note. **No duplicate ticket is created.**
+- If no ticket is found, the incident is left alone.
 
-## 4. Install dependencies
+### Step 8 — Save state and log LLM usage
+- The state file is saved after every poll, including polls that fail.
+- Every LLM call (model, tokens, latency, result) is appended to
+  `servicenow_jira_agent/llm_usage_log.jsonl`.
+- A usage summary is printed when the run ends.
+
+> **Errors never stop the monitor.** If Ollama is down, Jira is
+> misconfigured or a ServiceNow update fails, the problem is printed as a
+> warning on stderr and the poll continues.
+
+---
+
+## Part B — Setup (step by step)
+
+### Step 1 — Install prerequisites
+- **Python 3.10 or newer.** The code uses `str | None` type hints.
+- **Git.**
+- **Ollama** from https://ollama.com. You need it only for the monitor.
+
+### Step 2 — Get the code and install dependencies
+From the project root (`AI_POC`):
 
 ```bash
+python -m venv .venv
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# macOS/Linux:
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-## 5. Configure credentials
+This installs `langchain`, `langchain-openai`, `langchain-ollama`,
+`langchain-core`, `python-dotenv`, `requests` and `PyYAML`.
 
-Create a `.env` file in the project root (never commit it — it's already in
-`.gitignore`):
+### Step 3 — Prepare ServiceNow
+1. Log in at https://developer.servicenow.com and start or request your PDI.
+2. Note the instance URL, for example `https://dev12345.service-now.com`.
+3. Use the PDI `admin` account, or an integration user with the **`itil`** role.
+   The user must be able to:
+   - **read and update** the `incident` table, including the `state` field;
+   - **read** the `sys_user_group` table, which is used to find the assignment groups.
 
+   > ⚠️ Without these permissions ServiceNow **does not return an error**.
+   > It silently ignores the `state` change and stores the group name as an
+   > invalid reference, so the group shows up blank. The monitor now detects
+   > this and prints a warning (see Part F).
+4. Make sure both assignment groups exist (*User Administration → Groups*):
+   - `POC_DATA` (data incidents / Jira)
+   - `ServiceDesk` (general incidents)
+5. *(Only needed if the user can't read groups)* Copy each group's sys_id
+   into `.env` as `SERVICENOW_DATA_GROUP_SYS_ID` and
+   `SERVICENOW_SERVICEDESK_GROUP_SYS_ID`. To find a sys_id, open the group,
+   right-click the form header and choose **Copy sys_id**.
+
+### Step 4 — Prepare Jira Cloud
+1. Note your site URL, for example `https://your-site.atlassian.net`.
+2. Note the **project key** that tickets should be created in, for example `SCRUM`.
+   The project must have the **Task** issue type.
+3. Create an API token at
+   https://id.atlassian.com/manage-profile/security/api-tokens.
+4. Make sure the user **`sglearn`** exists in this Jira site and is
+   **assignable** in the project. Assignable means the user has the
+   *Assignable User* permission, which project members usually have.
+
+### Step 5 — Prepare Ollama
+```bash
+ollama pull qwen3:4b
+ollama list          # confirm the model is listed
 ```
-# ServiceNow
-SERVICENOW_INSTANCE=dev12345
+Ollama must be running at `http://localhost:11434`, or at whatever URL
+`OLLAMA_BASE_URL` is set to.
+
+### Step 6 — Create the `.env` file
+Create `.env` in the project root. It is already in `.gitignore`, so **never
+commit it**.
+
+```dotenv
+# --- ServiceNow (required) ---
+SERVICENOW_INSTANCE=https://dev12345.service-now.com
 SERVICENOW_USERNAME=admin
 SERVICENOW_PASSWORD=your_pdi_password
-SERVICENOW_NEW_STATE=1
-SERVICENOW_IN_PROGRESS_STATE=2
 
-# OpenAI (used by agent.py and incident_monitor.py)
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-
-# Ollama (used by incident_monitor_ollama.py)
-OLLAMA_MODEL=qwen3:4b
-OLLAMA_BASE_URL=http://localhost:11434
-
-# Jira (used by incident_monitor_ollama.py for auto-routing)
+# --- Jira (required for routing) ---
 JIRA_URL=https://your-site.atlassian.net
 JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=your_api_token
 JIRA_PROJECT=SCRUM
+JIRA_ASSIGNEE=sglearn
 
-# Optional: override the keyword file location
-DATA_KEYWORDS_FILE=servicenow_jira_agent/data_keywords.yaml
+# --- Ollama (required for the monitor) ---
+OLLAMA_MODEL=qwen3:4b
+OLLAMA_BASE_URL=http://localhost:11434
+
+# --- OpenAI (only for agent.py / incident_monitor.py) ---
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
 ```
 
-You only need the section(s) relevant to the tool you're running — e.g. the
-Q&A agent only needs the ServiceNow + OpenAI settings.
+> `SERVICENOW_INSTANCE` accepts either `dev12345` or the full URL. Use the
+> **full URL**, because `test/test_servicenow.py` requires it.
 
-## Usage
-
-### Q&A agent
-
-Interactive chat:
+### Step 7 — Test the connections
+Run these from the project root:
 
 ```bash
-python -m servicenow_jira_agent.agent
+python servicenow_jira_agent/test/test_servicenow.py   # expect "HTTP Status: 200"
+python servicenow_jira_agent/test/test_jira.py         # tests the Jira connection
 ```
 
-Single instruction:
+To check that the assignee resolves to a Jira account, run this. It only
+reads data and does not create anything:
 
 ```bash
-python -m servicenow_jira_agent.agent "List the 5 most recent incidents"
-python -m servicenow_jira_agent.agent "Show me all open (New) incidents"
-python -m servicenow_jira_agent.agent "Any priority 1 incidents right now?"
+python -c "from dotenv import load_dotenv; load_dotenv(); from servicenow_jira_agent.jira_client import JiraClient; print(JiraClient().find_user_account_id('sglearn'))"
 ```
+It should print an account ID such as `712020:...`. If it prints `None`,
+no Jira user matches `sglearn`.
 
-### Incident monitor + Jira auto-router (Ollama)
+### Step 8 — Run the monitor
+Always run from the **project root**. The state and output files are created
+in the current folder.
 
-Run once (e.g. from a scheduler):
-
+**First run** (records the baseline only):
 ```bash
 python -m servicenow_jira_agent.incident_monitor_ollama
 ```
 
-Run continuously, polling every 60 seconds:
-
+**Continuous monitoring** (polls every 60 seconds; press Ctrl+C to stop):
 ```bash
 python -m servicenow_jira_agent.incident_monitor_ollama --watch --interval 60
 ```
 
-Classify and log but don't touch Jira/ServiceNow state:
+### Step 9 — Test it end to end
+1. With the monitor running, create a new incident in ServiceNow that has a
+   data-related description, for example *"Daily sales report shows
+   duplicate rows after last night's ETL load"*.
+2. Wait for the next poll. The console shows a line like this:
+   ```
+   - INC0010042: Daily sales report shows duplicate rows ... [group=n/a -> category=Jira, keywords=['report', 'ETL']] -> Jira SCRUM-15 created, incident set to In Progress
+   ```
+3. Check Jira. **SCRUM-15** exists, has the matching priority and is **assigned to sglearn**.
+4. Check ServiceNow. The incident's state is **In Progress**, its group is
+   **POC_DATA**, and its work notes mention **SCRUM-15**.
+5. Create a general incident, for example *"Printer on floor 3 not working"*.
+   It is assigned to **ServiceDesk** and stays **New**.
 
+---
+
+## Part C — Command reference
+
+### `incident_monitor_ollama.py` flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--watch` | off | Keep polling in a loop |
+| `--interval N` | `60` | Seconds between polls (with `--watch`) |
+| `--limit N` | `50` | Maximum incidents fetched per poll |
+| `--format csv\|jsonl` | `csv` | Output file format |
+| `--output PATH` | `new_incidents_ollama.csv` | Output file |
+| `--state PATH` | `.incident_monitor_ollama_state.json` | State file |
+| `--keywords PATH` | `servicenow_jira_agent/data_keywords.yaml` | Keyword file |
+| `--incident-state N` | `1` | ServiceNow state to poll |
+| `--all-states` | off | Poll incidents in any state |
+| `--include-existing` | off | On the first run, also process the existing incidents |
+| `--full-sweep-interval N` | `10` | Full re-fetch every Nth poll (`1` = every poll, `0` = never after the first run) |
+| `--no-jira` | off | Classify and log only: no Jira tickets and **no ServiceNow updates** |
+| `--usage-summary` | — | Print LLM usage statistics and exit |
+
+Examples:
 ```bash
-python -m servicenow_jira_agent.incident_monitor_ollama --no-jira
+python -m servicenow_jira_agent.incident_monitor_ollama --no-jira          # dry run, no changes in Jira or ServiceNow
+python -m servicenow_jira_agent.incident_monitor_ollama --usage-summary    # LLM token and latency report
+python -m servicenow_jira_agent.incident_monitor_ollama --help
 ```
 
-Poll incidents in any state, not just "New", and write JSONL instead of CSV:
+### Environment variables
 
+| Variable | Default | Used for |
+|---|---|---|
+| `SERVICENOW_INSTANCE` / `_USERNAME` / `_PASSWORD` | — (required) | ServiceNow connection |
+| `SERVICENOW_NEW_STATE` | `1` | Incident state treated as "New" |
+| `SERVICENOW_IN_PROGRESS_STATE` | `2` | State set after a Jira ticket is created |
+| `SERVICENOW_DATA_GROUP_SYS_ID` | — (looked up by name) | sys_id of `POC_DATA`, if the user can't read groups |
+| `SERVICENOW_SERVICEDESK_GROUP_SYS_ID` | — (looked up by name) | sys_id of `ServiceDesk`, if the user can't read groups |
+| `JIRA_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` / `JIRA_PROJECT` | — (required for routing) | Jira connection |
+| `JIRA_ASSIGNEE` | `sglearn` | Jira user that new tickets are assigned to. An empty value leaves tickets unassigned |
+| `OLLAMA_MODEL` | `qwen3:4b` | Classification model |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server |
+| `OLLAMA_TIMEOUT_SECONDS` | `180` | Timeout per classification call |
+| `OLLAMA_NUM_PREDICT` | `2048` | Maximum tokens per classification call |
+| `OLLAMA_MAX_CONCURRENT_CALLS` | `2` | Number of parallel classification calls |
+| `DATA_KEYWORDS_FILE` | `servicenow_jira_agent/data_keywords.yaml` | Keyword file location |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | — / `gpt-4o-mini` | `agent.py` and `incident_monitor.py` only |
+
+### Q&A agent (`agent.py`, read-only)
 ```bash
-python -m servicenow_jira_agent.incident_monitor_ollama --all-states --format jsonl
+python -m servicenow_jira_agent.agent                                     # interactive; type 'exit' to quit
+python -m servicenow_jira_agent.agent "List the 5 most recent incidents"  # single question
+python -m servicenow_jira_agent.agent "Any priority 1 incidents right now?"
 ```
+The agent uses the `list_servicenow_incidents` tool (`tools.py`) to fetch live
+data from your PDI. It never changes ServiceNow and never creates Jira tickets.
 
-Print a summary of every LLM call logged so far (tokens, latency, outcomes)
-without polling ServiceNow:
-
+### Legacy monitor (`incident_monitor.py`, OpenAI, no routing)
 ```bash
-python -m servicenow_jira_agent.incident_monitor_ollama --usage-summary
-```
-
-Other flags: `--output`, `--state`, `--limit`, `--keywords`,
-`--incident-state`, `--include-existing` — run with `--help` for the full
-list.
-
-### Incident monitor (OpenAI, no Jira routing)
-
-```bash
-python -m servicenow_jira_agent.incident_monitor
 python -m servicenow_jira_agent.incident_monitor --watch --interval 60
 ```
 
-## Customizing data-vs-general classification
+---
 
-Edit `servicenow_jira_agent/data_keywords.yaml` — one keyword/phrase per
-line, no code changes or restart required (the file is re-read whenever its
-modified time changes, even while `--watch` is running). Matching is
-case-insensitive substring matching against the short description +
-description. These keywords are only a *hint*: the LLM still reads the full
-incident text and can classify an incident as `Jira` even with zero keyword
-matches, or as `ServiceDesk` despite a keyword match (e.g. "database server
-is unreachable" is infrastructure, not a data problem).
+## Part D — Customizing the classification
 
-Incidents assigned to the **`POC_DATA`** group always route to Jira
-immediately, bypassing keyword/LLM classification entirely.
+- **Keywords:** edit `servicenow_jira_agent/data_keywords.yaml`, with one entry
+  per line (`- keyword`). Changes take effect on the **next poll**, even while
+  `--watch` is running. No restart is needed.
+- **Always send a team's incidents to Jira:** assign them to `POC_DATA` in
+  ServiceNow. They skip keyword and LLM classification entirely.
+- **Different assignee:** set `JIRA_ASSIGNEE` in `.env` to a username,
+  display name or email, then restart the monitor.
 
-## Notes
+---
 
-- ServiceNow `state` uses numeric codes: 1=New, 2=In Progress, 3=On Hold,
-  6=Resolved, 7=Closed, 8=Canceled. Override `SERVICENOW_NEW_STATE` /
-  `SERVICENOW_IN_PROGRESS_STATE` if your instance customizes these.
-- State files (`.incident_monitor_state.json`,
-  `.incident_monitor_ollama_state.json`) and output files
-  (`new_incidents.csv`, `new_incidents_ollama.csv`) are gitignored — they're
-  local run artifacts, not source.
-- `llm_usage_log.jsonl` accumulates across runs/processes and can be
-  summarized any time with `--usage-summary`, independent of whether
-  `--watch` is still running elsewhere.
-- The Q&A agent's tool queries live data from your PDI on every call —
-  nothing is cached or simulated. For advanced filtering it can pass a raw
-  `sysparm_query` string (e.g. `priority=1^active=true`).
-- Both ServiceNow and Jira clients use basic auth (PDI username/password,
-  and Jira email + API token respectively), which is what a PDI and Jira
-  Cloud support out of the box.
-- `incident_monitor_ollama.py` never creates a duplicate Jira ticket for the
-  same incident: before creating one it searches Jira for an existing issue
-  whose summary contains the incident number, and reuses that key if found.
-  This also covers an incident whose ServiceNow state gets reset back to
-  New after already being routed — the next poll detects it, confirms the
-  existing ticket, and restores the state to In Progress instead of
-  re-routing it.
+## Part E — Files and project layout
+
+```
+AI_POC/
+  .env                                  # your credentials (git-ignored)
+  requirements.txt
+  new_incidents_ollama.csv              # monitor output (git-ignored)
+  .incident_monitor_ollama_state.json   # monitor state (git-ignored)
+  servicenow_jira_agent/
+    servicenow_client.py         # ServiceNow Table API: list_incidents(), update_incident()
+    jira_client.py               # Jira REST v3: create_issue(), find_issue_by_summary_text(),
+                                 #   find_user_account_id(), assign_issue()
+    incident_monitor_ollama.py   # main pipeline (Part A)
+    incident_monitor.py          # legacy OpenAI monitor
+    agent.py / tools.py          # Q&A agent and its LangChain tool
+    data_keywords.yaml           # editable data keywords
+    llm_usage_tracker.py         # LLM usage logging -> llm_usage_log.jsonl
+    test/test_servicenow.py      # ServiceNow connection check
+    test/test_jira.py            # Jira connection check
+```
+
+> **Reset the monitor:** delete `.incident_monitor_ollama_state.json`. The
+> next run then records a new baseline. Jira's duplicate check stops tickets
+> from being created twice.
+
+---
+
+## Part F — Troubleshooting
+
+| Message / symptom | Cause | Fix |
+|---|---|---|
+| `Configuration error: Missing ServiceNow connection settings` | `SERVICENOW_*` values are missing from `.env` | Complete Step 6 and run from the project root |
+| `Warning: Jira is not configured` | `JIRA_*` values are missing | Add all four `JIRA_*` values |
+| `Warning: no Jira user found matching 'sglearn'` | The user doesn't exist or isn't visible to the API user | Check the user in Jira, or set `JIRA_ASSIGNEE` to their email |
+| `... failed to assign it to 'sglearn' (Jira API returned 400 ...)` | The user isn't assignable in the project | Give the user the *Assignable User* permission in the project |
+| `Warning: LLM classification failed ...` | Ollama isn't running, the model isn't pulled, or the call timed out | Run `ollama list`, pull the model, or increase `OLLAMA_TIMEOUT_SECONDS` |
+| Everything is classified ServiceDesk | LLM timeouts (each failure defaults to ServiceDesk) | Check `--usage-summary` for failures and reduce `OLLAMA_MAX_CONCURRENT_CALLS` |
+| `... failed to update its ServiceNow state to In Progress (... 403 ...)` | The ServiceNow user can't update incidents | Give the user the `itil` role, or use `admin` |
+| `ServiceNow assignment group '...' not found (or the API user lacks read access ...)` | The group doesn't exist, or the user can't read `sys_user_group` | Give the user the `itil` role, or set `SERVICENOW_*_GROUP_SYS_ID` (Part B, Step 3.5) |
+| `ServiceNow did not apply state='2' ...` / `... assignment_group=...` | ServiceNow silently ignored a field the user isn't allowed to write | Give the user the `itil` role |
+| Incident has a Jira key but stays **New**, or its group is blank | Same permissions problem, from a run before these checks were added | Fix the permissions, then correct those incidents by hand |
+| First run shows "No new incidents." | Expected: the first run only records the baseline | Create a new incident, or use `--include-existing` |
+
+### ServiceNow state codes
+`1` New · `2` In Progress · `3` On Hold · `6` Resolved · `7` Closed · `8` Canceled

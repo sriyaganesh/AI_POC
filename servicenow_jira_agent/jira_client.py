@@ -99,6 +99,55 @@ class JiraClient:
         key = result["key"]
         return JiraIssue(key=key, url=f"{self.url}/browse/{key}")
 
+    def find_user_account_id(self, query: str) -> str | None:
+        """
+        Look up a Jira Cloud user by username, display name or email (e.g.
+        "sglearn") and return their accountId, or None if no user matches.
+
+        Jira Cloud's REST API v3 only accepts accountIds for the assignee, not
+        usernames, so this is needed before calling assign_issue().
+        """
+        response = requests.get(
+            f"{self.url}/rest/api/3/user/search",
+            auth=(self.email, self.api_token),
+            headers={"Accept": "application/json"},
+            params={"query": query, "maxResults": 10},
+            timeout=self.timeout,
+        )
+
+        if response.status_code != 200:
+            raise JiraAPIError(
+                f"Jira API returned {response.status_code}: {response.text[:500]}"
+            )
+
+        users = [u for u in response.json() if u.get("accountId")]
+        if not users:
+            return None
+
+        # Prefer an exact (case-insensitive) match on display name, email or
+        # the email's local part over a looser prefix match.
+        wanted = query.strip().lower()
+        for user in users:
+            email = (user.get("emailAddress") or "").lower()
+            if wanted in {(user.get("displayName") or "").lower(), email, email.split("@")[0]}:
+                return user["accountId"]
+        return users[0]["accountId"]
+
+    def assign_issue(self, issue_key: str, account_id: str) -> None:
+        """Set the assignee of an existing issue to the given accountId."""
+        response = requests.put(
+            f"{self.url}/rest/api/3/issue/{issue_key}/assignee",
+            auth=(self.email, self.api_token),
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            json={"accountId": account_id},
+            timeout=self.timeout,
+        )
+
+        if response.status_code != 204:
+            raise JiraAPIError(
+                f"Jira API returned {response.status_code}: {response.text[:500]}"
+            )
+
     def find_issue_by_summary_text(self, text: str) -> JiraIssue | None:
         """
         Search the configured project for an existing (any status) issue

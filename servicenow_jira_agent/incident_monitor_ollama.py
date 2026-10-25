@@ -73,9 +73,28 @@ Configuration (via environment variables / .env):
                                  Jira ticket is created for it (default: "2").
     DATA_KEYWORDS_FILE          Path to the data-related keywords YAML file
                                  (default: data_keywords.yaml next to this script).
+    OLLAMA_TIMEOUT_SECONDS       Seconds to wait for a single classification call
+                                 before giving up and defaulting to ServiceDesk
+                                 (default: "180"; qwen3:4b's own successful calls
+                                 routinely take 30-150s, see llm_usage_log.jsonl).
+    OLLAMA_NUM_PREDICT           Max tokens (reasoning + answer) per classification
+                                 call; too low truncates the model before it emits
+                                 JIRA/SERVICEDESK, which also defaults to
+                                 ServiceDesk (default: "2048").
+    OLLAMA_MAX_CONCURRENT_CALLS  Max incidents classified concurrently against
+                                 Ollama; higher values speed up large batches but
+                                 can starve a single local model instance into
+                                 timing out more often (default: "2").
     JIRA_URL, JIRA_EMAIL,
     JIRA_API_TOKEN, JIRA_PROJECT Jira Cloud connection settings used to create
                                  tickets for incidents classified as "Jira".
+    SERVICENOW_DATA_GROUP_SYS_ID,
+    SERVICENOW_SERVICEDESK_GROUP_SYS_ID
+                                 Optional sys_ids of the POC_DATA /
+                                 ServiceDesk groups, for when the
+                                 API user can't look groups up by name.
+    JIRA_ASSIGNEE               Jira user newly created tickets are assigned to
+                                 (default: "sglearn"; empty to leave unassigned).
 """
 
 from __future__ import annotations
@@ -129,7 +148,51 @@ JIRA_ASSIGNMENT_GROUP = "POC_DATA"
 
 # Assignment group that incidents classified as "ServiceDesk" are assigned to
 # in ServiceNow (see route_incidents_to_servicedesk()).
-SERVICE_DESK_ASSIGNMENT_GROUP = "POC_SERVICE_DESK_SUPPORT"
+SERVICE_DESK_ASSIGNMENT_GROUP = "ServiceDesk"
+
+# Jira user (username, display name or email) that newly created Jira
+# tickets are assigned to -- see _assign_jira_ticket(). Set JIRA_ASSIGNEE to
+# an empty string to leave tickets unassigned.
+JIRA_ASSIGNEE = os.getenv("JIRA_ASSIGNEE", "sglearn")
+
+# Maps a ServiceNow incident priority's leading number (1=Critical..5=Planning,
+# the standard out-of-the-box scale) to the equivalent Jira priority name, so
+# a created Jira ticket's own Priority field reflects how urgent the
+# ServiceNow incident actually was instead of silently defaulting to
+# whatever Jira picks on its own (usually "Medium") -- see
+# _map_servicenow_priority() / create_jira_ticket().
+SERVICENOW_TO_JIRA_PRIORITY = {
+    "1": "Highest",
+    "2": "High",
+    "3": "Medium",
+    "4": "Low",
+    "5": "Lowest",
+}
+
+# How long to wait for a single Ollama classification call before giving up
+# and falling back to ServiceDesk (see _classify_with_llm's except-block).
+# qwen3:4b's chain-of-thought reasoning routinely takes 30-150s on modest
+# hardware (see llm_usage_log.jsonl) -- the old 30s default was shorter than
+# most *successful* calls, so calls were timing out -- and silently
+# defaulting to ServiceDesk -- far more often than the model was actually
+# choosing ServiceDesk on the merits. Override via OLLAMA_TIMEOUT_SECONDS.
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+
+# Max tokens of chain-of-thought + answer the model may generate per
+# classification call. Too low and a genuinely tricky case can get cut off
+# mid-thought before ever emitting the JIRA/SERVICEDESK word, which (per
+# categorize_incident's "JIRA" in answer check) also falls back to
+# ServiceDesk -- see the reasoning note in _get_llm() below. Override via
+# OLLAMA_NUM_PREDICT.
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "2048"))
+
+# Max number of incidents classified concurrently against the local Ollama
+# server. Firing several classification requests at once at a single small
+# local model instance makes each one slower and more likely to time out
+# (see llm_usage_log.jsonl, where batches of concurrent calls show far more
+# timeouts than isolated ones) -- lowering this trades poll-batch latency
+# for reliability. Override via OLLAMA_MAX_CONCURRENT_CALLS.
+OLLAMA_MAX_CONCURRENT_CALLS = int(os.getenv("OLLAMA_MAX_CONCURRENT_CALLS", "2"))
 
 CSV_FIELDS = [
     "detected_at",
@@ -350,14 +413,18 @@ def _get_llm():
             # before answering -- qwen3:4b needs several hundred tokens of
             # thinking for even a simple classification. Too low and the
             # response gets cut off mid-thought with no answer at all.
-            num_predict=1024,
+            num_predict=OLLAMA_NUM_PREDICT,
             # Keep the model resident between polls instead of letting
             # Ollama's default 5-minute idle timeout unload it, which would
             # otherwise cost a reload on the next classification.
             keep_alive="30m",
-            # Fail fast instead of hanging the poll loop indefinitely if
-            # Ollama is unreachable, still loading, or wedged.
-            client_kwargs={"timeout": 30},
+            # Fail fast if Ollama is unreachable or well and truly wedged,
+            # but give it enough rope to actually finish first -- qwen3:4b's
+            # own successful calls routinely take 30-150s (see
+            # llm_usage_log.jsonl), so a short timeout here doesn't catch
+            # only genuine hangs, it also aborts normal slow calls and
+            # silently defaults them to ServiceDesk.
+            client_kwargs={"timeout": OLLAMA_TIMEOUT_SECONDS},
         )
     return _llm_client
 
@@ -492,7 +559,9 @@ def categorize_incidents(
             to_classify.append((inc, matched))
 
     if to_classify:
-        with ThreadPoolExecutor(max_workers=min(4, len(to_classify))) as pool:
+        with ThreadPoolExecutor(
+            max_workers=min(OLLAMA_MAX_CONCURRENT_CALLS, len(to_classify))
+        ) as pool:
             futures = {
                 inc.sys_id: (
                     pool.submit(
@@ -514,6 +583,9 @@ def categorize_incidents(
 # Lazily built/cached Jira client -- see _get_jira_client().
 _jira_client: JiraClient | None = None
 
+# Cached accountId of JIRA_ASSIGNEE -- see _assign_jira_ticket().
+_jira_assignee_account_id: str | None = None
+
 
 def _get_jira_client() -> JiraClient:
     """
@@ -525,6 +597,43 @@ def _get_jira_client() -> JiraClient:
     if _jira_client is None:
         _jira_client = JiraClient()
     return _jira_client
+
+
+def _map_servicenow_priority(priority: str) -> str | None:
+    """
+    Map a ServiceNow incident priority display value (e.g. "1 - Critical",
+    "4 - Low") to the equivalent Jira priority name (see
+    SERVICENOW_TO_JIRA_PRIORITY).
+
+    Returns None if the priority is blank or unrecognized, so the caller can
+    create the ticket without touching Jira's Priority field rather than
+    guessing at a value -- better to leave it at Jira's own default than to
+    set it to something wrong.
+    """
+    priority = (priority or "").strip()
+    if not priority:
+        return None
+
+    # ServiceNow's display value is typically "<n> - <label>" -- the leading
+    # digit is the reliable, locale-independent part.
+    leading_digit = priority.split(" ", 1)[0].strip()
+    if leading_digit in SERVICENOW_TO_JIRA_PRIORITY:
+        return SERVICENOW_TO_JIRA_PRIORITY[leading_digit]
+
+    # Fall back to matching the label text, in case priority came through as
+    # something else (e.g. just "Critical", or display values weren't used).
+    label = priority.lower()
+    if "critical" in label or "highest" in label:
+        return "Highest"
+    if "moderate" in label or "medium" in label:
+        return "Medium"
+    if "lowest" in label or "planning" in label:
+        return "Lowest"
+    if "low" in label:
+        return "Low"
+    if "high" in label:
+        return "High"
+    return None
 
 
 def _build_jira_fields(incident: Incident) -> tuple[str, str]:
@@ -548,6 +657,34 @@ def _build_jira_fields(incident: Incident) -> tuple[str, str]:
     return summary, description
 
 
+def _assign_jira_ticket(jira: JiraClient, issue_key: str, incident_number: str) -> None:
+    """
+    Assign a newly created Jira ticket to JIRA_ASSIGNEE. Never raises: a
+    failed assignment only logs a warning, since the ticket itself was
+    created and the incident should still move to In Progress.
+    """
+    global _jira_assignee_account_id
+    if not JIRA_ASSIGNEE:
+        return
+    try:
+        if _jira_assignee_account_id is None:
+            _jira_assignee_account_id = jira.find_user_account_id(JIRA_ASSIGNEE)
+        if not _jira_assignee_account_id:
+            print(
+                f"Warning: no Jira user found matching '{JIRA_ASSIGNEE}'; "
+                f"leaving {issue_key} ({incident_number}) unassigned.",
+                file=sys.stderr,
+            )
+            return
+        jira.assign_issue(issue_key, _jira_assignee_account_id)
+    except Exception as e:  # noqa: BLE001 - never let assignment break ticket routing
+        print(
+            f"Warning: created Jira ticket {issue_key} for {incident_number}, but failed to "
+            f"assign it to '{JIRA_ASSIGNEE}' ({e}).",
+            file=sys.stderr,
+        )
+
+
 def create_jira_ticket(incident: Incident) -> str | None:
     """
     Create a Jira ticket from a ServiceNow incident's details and return its
@@ -565,6 +702,7 @@ def create_jira_ticket(incident: Incident) -> str | None:
     running (the incident is left as-is in ServiceNow for a later retry).
     """
     summary, description = _build_jira_fields(incident)
+    jira_priority = _map_servicenow_priority(incident.priority)
     try:
         jira = _get_jira_client()
 
@@ -585,7 +723,28 @@ def create_jira_ticket(incident: Incident) -> str | None:
             )
             return existing.key
 
-        issue = jira.create_issue(summary=summary, description=description, issue_type="Task")
+        extra_fields = {"priority": {"name": jira_priority}} if jira_priority else None
+        try:
+            issue = jira.create_issue(
+                summary=summary,
+                description=description,
+                issue_type="Task",
+                extra_fields=extra_fields,
+            )
+        except JiraAPIError as e:
+            if not extra_fields:
+                raise
+            # The project's priority scheme may not have a "<jira_priority>"
+            # option (custom schemes vary per project), or the create screen
+            # may not expose Priority at all -- don't let that block the
+            # incident from being tracked in Jira; retry once without it.
+            print(
+                f"Warning: failed to create Jira ticket for {incident.number} with priority "
+                f"'{jira_priority}' ({e}); retrying without setting priority.",
+                file=sys.stderr,
+            )
+            issue = jira.create_issue(summary=summary, description=description, issue_type="Task")
+        _assign_jira_ticket(jira, issue.key, incident.number)
         return issue.key
     except JiraConfigError as e:
         print(f"Warning: Jira is not configured ({e}); skipping ticket creation.", file=sys.stderr)
@@ -600,6 +759,82 @@ def create_jira_ticket(incident: Incident) -> str | None:
             file=sys.stderr,
         )
     return None
+
+
+# Optional sys_id overrides for the assignment groups above, for when the
+# ServiceNow API user can't read sys_user_group to look them up by name (see
+# _resolve_group_sys_id()). Find a group's sys_id in ServiceNow via
+# User Administration > Groups > right-click the header > Copy sys_id.
+_GROUP_SYS_ID_OVERRIDES = {
+    JIRA_ASSIGNMENT_GROUP: os.getenv("SERVICENOW_DATA_GROUP_SYS_ID", ""),
+    SERVICE_DESK_ASSIGNMENT_GROUP: os.getenv("SERVICENOW_SERVICEDESK_GROUP_SYS_ID", ""),
+}
+
+# Cache of assignment group name -> sys_id (None if not found).
+_group_sys_ids: dict[str, str | None] = {}
+
+
+def _resolve_group_sys_id(client: ServiceNowClient, name: str) -> str | None:
+    """
+    Return the sys_id of the ServiceNow assignment group `name`, from its
+    SERVICENOW_*_GROUP_SYS_ID override if set, else by looking it up.
+
+    The sys_id is needed because writing a group *name* into the incident's
+    assignment_group reference field only works if the API user can read
+    sys_user_group; otherwise ServiceNow stores the raw name as a broken
+    reference and the group shows up blank on the incident.
+    """
+    override = (_GROUP_SYS_ID_OVERRIDES.get(name) or "").strip()
+    if override:
+        return override
+    if name not in _group_sys_ids:
+        _group_sys_ids[name] = client.find_group_sys_id(name)
+        if not _group_sys_ids[name]:
+            print(
+                f"Warning: ServiceNow assignment group '{name}' not found (or the API user "
+                "lacks read access to sys_user_group). Grant the user the itil role, or set "
+                "its sys_id via SERVICENOW_DATA_GROUP_SYS_ID / "
+                "SERVICENOW_SERVICEDESK_GROUP_SYS_ID.",
+                file=sys.stderr,
+            )
+    return _group_sys_ids[name]
+
+
+def _update_incident_checked(
+    client: ServiceNowClient, incident: Incident, fields: dict[str, str], group_name: str
+) -> bool:
+    """
+    Update an incident with `fields` plus assignment_group = `group_name`
+    (resolved to its sys_id), then verify ServiceNow actually saved the
+    state/assignment_group -- it silently ignores fields the API user isn't
+    allowed to write instead of returning an error.
+
+    Returns True if everything requested was applied; logs a warning for
+    each field that wasn't and returns False. ServiceNowAPIError propagates.
+    """
+    fields = dict(fields)
+    group_sys_id = _resolve_group_sys_id(client, group_name)
+    if group_sys_id:
+        fields["assignment_group"] = group_sys_id
+
+    saved = client.update_incident(incident.sys_id, fields)
+
+    ok = bool(group_sys_id)
+    for field in ("state", "assignment_group"):
+        if field not in fields:
+            continue
+        value = saved.get(field)
+        if isinstance(value, dict):
+            value = value.get("value")
+        if value != fields[field]:
+            ok = False
+            print(
+                f"Warning: ServiceNow did not apply {field}={fields[field]!r} to "
+                f"{incident.number} (saved value: {value!r}); the API user likely lacks "
+                "write access to this field (needs the itil role).",
+                file=sys.stderr,
+            )
+    return ok
 
 
 def route_incidents_to_jira(
@@ -629,13 +864,14 @@ def route_incidents_to_jira(
         jira_keys[inc.sys_id] = jira_key
 
         try:
-            client.update_incident(
-                inc.sys_id,
+            _update_incident_checked(
+                client,
+                inc,
                 {
                     "state": IN_PROGRESS_INCIDENT_STATE,
-                    "assignment_group": JIRA_ASSIGNMENT_GROUP,
                     "work_notes": f"Routed to Jira ticket {jira_key} by incident_monitor_ollama.",
                 },
+                JIRA_ASSIGNMENT_GROUP,
             )
         except ServiceNowAPIError as e:
             print(
@@ -660,7 +896,7 @@ def route_incidents_to_servicedesk(
 ) -> list[str]:
     """
     For every incident classified as "ServiceDesk", assign the ServiceNow
-    incident to SERVICE_DESK_ASSIGNMENT_GROUP (POC_SERVICE_DESK_SUPPORT) with
+    incident to SERVICE_DESK_ASSIGNMENT_GROUP (ServiceDesk) with
     a work note recording the automatic classification.
 
     Returns the sys_ids of incidents successfully updated; incidents that
@@ -677,17 +913,18 @@ def route_incidents_to_servicedesk(
             continue
 
         try:
-            client.update_incident(
-                inc.sys_id,
+            if _update_incident_checked(
+                client,
+                inc,
                 {
-                    "assignment_group": SERVICE_DESK_ASSIGNMENT_GROUP,
                     "work_notes": (
                         "Classified as ServiceDesk by incident_monitor_ollama; "
                         f"assigned to {SERVICE_DESK_ASSIGNMENT_GROUP}."
                     ),
                 },
-            )
-            updated.append(inc.sys_id)
+                SERVICE_DESK_ASSIGNMENT_GROUP,
+            ):
+                updated.append(inc.sys_id)
         except ServiceNowAPIError as e:
             print(
                 f"Warning: failed to assign {inc.number} to "
@@ -761,16 +998,17 @@ def reconcile_reverted_incidents(
             continue
 
         try:
-            client.update_incident(
-                inc.sys_id,
+            _update_incident_checked(
+                client,
+                inc,
                 {
                     "state": IN_PROGRESS_INCIDENT_STATE,
-                    "assignment_group": JIRA_ASSIGNMENT_GROUP,
                     "work_notes": (
                         f"State was found reset to New, but Jira ticket {existing.key} "
                         "already exists for this incident; restoring state to In Progress."
                     ),
                 },
+                JIRA_ASSIGNMENT_GROUP,
             )
             fixed[inc.sys_id] = (inc.number, existing.key)
             print(
