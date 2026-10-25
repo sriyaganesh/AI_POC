@@ -44,15 +44,15 @@ This is what `incident_monitor_ollama.py` does on **every poll**.
   `--include-existing`.
 
 ### Step 3 — Classify each new incident as `Jira` or `ServiceDesk`
-The checks below run in this order:
-1. **Assignment-group shortcut.** If the incident's assignment group is
-   already `POC_DATA` (matched case-insensitively, with spaces treated as underscores),
-   the incident is classified **Jira** straight away. No LLM call is made.
-2. **Keyword hint.** The short description and description are compared
+**Every** new incident is classified on its content. The assignment group it
+was raised with is ignored: an incident assigned straight to `POC_DATA` is
+still checked, and is moved to `ServiceDesk` if it isn't a data issue. The
+checks below run in this order:
+1. **Keyword hint.** The short description and description are compared
    against `servicenow_jira_agent/data_keywords.yaml`. Matching is a
    case-insensitive substring match. The keywords cover general data terms
    and ETL/BI tool names such as Informatica, Airflow, Snowflake and Power BI.
-3. **LLM decision.** The incident text and the keyword hint are sent to the
+2. **LLM decision.** The incident text and the keyword hint are sent to the
    local Ollama model, which answers exactly `JIRA` or `SERVICEDESK`. The
    keyword hint is supporting evidence only:
    - "database server is unreachable" can still be classified ServiceDesk
@@ -104,8 +104,9 @@ nothing else happens to it.
 
 ### Step 5 — Route "ServiceDesk" incidents
 Every incident that is **not** classified Jira is classified **ServiceDesk**.
-This includes incidents where the LLM call failed. Each one is updated in
-ServiceNow with:
+This includes incidents where the LLM call failed, and incidents that were
+raised with `POC_DATA` as their group but turned out not to be data issues.
+Each one is updated in ServiceNow with:
 - `assignment_group` = `ServiceDesk`
 - a work note recording the classification.
 
@@ -278,6 +279,9 @@ python -m servicenow_jira_agent.incident_monitor_ollama --watch --interval 60
    **POC_DATA**, and its work notes mention **SCRUM-15**.
 5. Create a general incident, for example *"Printer on floor 3 not working"*.
    It is assigned to **ServiceDesk** and stays **New**.
+6. Create another general incident, but set its assignment group to
+   **POC_DATA** when you raise it. It is still classified on its content, so
+   no Jira ticket is created and its group changes to **ServiceDesk**.
 
 ---
 
@@ -348,8 +352,10 @@ python -m servicenow_jira_agent.incident_monitor --watch --interval 60
 - **Keywords:** edit `servicenow_jira_agent/data_keywords.yaml`, with one entry
   per line (`- keyword`). Changes take effect on the **next poll**, even while
   `--watch` is running. No restart is needed.
-- **Always send a team's incidents to Jira:** assign them to `POC_DATA` in
-  ServiceNow. They skip keyword and LLM classification entirely.
+- **Assignment group doesn't decide routing:** assigning an incident to
+  `POC_DATA` when it is raised does **not** send it to Jira. Every new
+  incident goes through keyword and LLM classification. To steer
+  borderline cases towards Jira, add keywords instead.
 - **Different assignee:** set `JIRA_ASSIGNEE` in `.env` to a username,
   display name or email, then restart the monitor.
 
@@ -396,6 +402,7 @@ AI_POC/
 | `ServiceNow assignment group '...' not found (or the API user lacks read access ...)` | The group doesn't exist, or the user can't read `sys_user_group` | Give the user the `itil` role, or set `SERVICENOW_*_GROUP_SYS_ID` (Part B, Step 3.5) |
 | `ServiceNow did not apply state='2' ...` / `... assignment_group=...` | ServiceNow silently ignored a field the user isn't allowed to write | Give the user the `itil` role |
 | Incident has a Jira key but stays **New**, or its group is blank | Same permissions problem, from a run before these checks were added | Fix the permissions, then correct those incidents by hand |
+| Incident raised in `POC_DATA` was moved to `ServiceDesk` | Expected: the assignment group doesn't decide routing, and the LLM judged it not to be a data issue | If it really is a data issue, add matching keywords to `data_keywords.yaml` (Part D) |
 | First run shows "No new incidents." | Expected: the first run only records the baseline | Create a new incident, or use `--include-existing` |
 
 ### ServiceNow state codes

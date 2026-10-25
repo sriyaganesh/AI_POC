@@ -38,8 +38,10 @@ are recorded as a baseline but NOT written to the output file, so the output
 file only ever contains incidents created after monitoring started. Pass
 --include-existing to dump the baseline to the output file too.
 
-The Jira-vs-ServiceDesk classification for incidents not already routed by
-assignment group combines two signals:
+Every new incident is classified on its content, whatever assignment group
+it was raised with (an incident assigned straight to POC_DATA is still
+checked, and goes to ServiceDesk if it isn't a data issue). The
+Jira-vs-ServiceDesk classification combines two signals:
   1. Keyword matching against the short/long description, using the
      user-editable keyword list in data_keywords.yaml (see --keywords),
      which includes both general data terms and data/ETL tool names
@@ -142,8 +144,10 @@ DEFAULT_KEYWORDS_FILE = Path(
     os.getenv("DATA_KEYWORDS_FILE", str(Path(__file__).resolve().parent / "data_keywords.yaml"))
 )
 
-# Assignment group (case/spacing-insensitive) that routes an incident to Jira
-# instead of ServiceDesk.
+# Assignment group that incidents classified as "Jira" are assigned to in
+# ServiceNow (see route_incidents_to_jira()). An incident's existing
+# assignment group never decides its routing -- every incident is classified
+# on its content.
 JIRA_ASSIGNMENT_GROUP = "POC_DATA"
 
 # Assignment group that incidents classified as "ServiceDesk" are assigned to
@@ -210,9 +214,8 @@ CSV_FIELDS = [
     "jira_key",
 ]
 
-# System prompt used to ask the LLM whether an incident (that isn't already
-# routed to POC_DATA by assignment group) is a data issue and should still
-# go to Jira, or is a general issue that belongs on ServiceDesk.
+# System prompt used to ask the LLM whether an incident is a data issue and
+# should go to Jira, or is a general issue that belongs on ServiceDesk.
 
 CLASSIFY_SYSTEM_PROMPT = """
 You are triaging IT support incidents for routing.
@@ -387,8 +390,8 @@ llm_usage_tracker = LLMUsageTracker()
 def _get_llm():
     """
     Lazily build and cache the Ollama chat model used for classification.
-    Only imported/instantiated when actually needed, so incidents that are
-    already resolved by assignment group never require an Ollama call.
+    Only imported/instantiated when actually needed, so a poll with no new
+    incidents never requires an Ollama call.
     """
     global _llm_client
     if _llm_client is None:
@@ -507,18 +510,17 @@ def categorize_incident(
     incident: Incident, keywords: list[str] | None = None
 ) -> tuple[str, list[str]]:
     """
-    Categorize an incident, returning (category, matched_keywords):
-    1. Assigned to the POC_DATA group -> ("Jira", []).
-    2. Otherwise, match the short description and description against the
-       configurable data-related keyword list, then ask an LLM (Ollama) to
-       decide -- using those keyword matches as supporting evidence --
-       whether the incident is a data issue ("Jira") or a general issue
-       ("ServiceDesk").
-    """
-    group = (incident.assignment_group or "").strip().lower().replace(" ", "_")
-    if group == JIRA_ASSIGNMENT_GROUP.lower():
-        return "Jira", []
+    Categorize an incident, returning (category, matched_keywords): match
+    the short description and description against the configurable
+    data-related keyword list, then ask an LLM (Ollama) to decide -- using
+    those keyword matches as supporting evidence -- whether the incident is
+    a data issue ("Jira") or a general issue ("ServiceDesk").
 
+    The incident's current assignment group is deliberately ignored: an
+    incident assigned directly to POC_DATA when it was raised is still
+    checked on its content, and is reassigned to ServiceDesk if it isn't
+    actually a data issue.
+    """
     keywords = keywords if keywords is not None else load_data_keywords()
     matched = find_matched_keywords(
         incident.short_description, incident.description, keywords
@@ -536,9 +538,10 @@ def categorize_incidents(
     Categorize a batch of incidents, keyed by sys_id, returning
     (category, matched_keywords) per incident.
 
-    Incidents already resolved by assignment group are answered immediately
-    without touching the keyword list or the LLM. The rest are matched
-    against the configurable data-related keyword list and then classified
+    Every incident is classified on its content -- its current assignment
+    group is never trusted as a routing decision (see categorize_incident()).
+    Each is matched against the configurable data-related keyword list and
+    then classified
     concurrently (Ollama can serve multiple requests in parallel -- see
     OLLAMA_NUM_PARALLEL) instead of one sequential round trip per incident,
     so a poll that turns up several new incidents at once isn't gated on
@@ -549,14 +552,10 @@ def categorize_incidents(
     results: dict[str, tuple[str, list[str]]] = {}
     to_classify: list[tuple[Incident, list[str]]] = []
     for inc in incidents:
-        group = (inc.assignment_group or "").strip().lower().replace(" ", "_")
-        if group == JIRA_ASSIGNMENT_GROUP.lower():
-            results[inc.sys_id] = ("Jira", [])
-        else:
-            matched = find_matched_keywords(
-                inc.short_description, inc.description, keywords
-            )
-            to_classify.append((inc, matched))
+        matched = find_matched_keywords(
+            inc.short_description, inc.description, keywords
+        )
+        to_classify.append((inc, matched))
 
     if to_classify:
         with ThreadPoolExecutor(

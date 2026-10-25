@@ -43,10 +43,6 @@ from .servicenow_client import (
 DEFAULT_OUTPUT = Path("new_incidents.csv")
 DEFAULT_STATE = Path(".incident_monitor_state.json")
 
-# Assignment group (case/spacing-insensitive) that routes an incident to Jira
-# instead of ServiceDesk.
-JIRA_ASSIGNMENT_GROUP = "POC_DATA"
-
 CSV_FIELDS = [
     "detected_at",
     "number",
@@ -61,9 +57,8 @@ CSV_FIELDS = [
     "category",
 ]
 
-# System prompt used to ask the LLM whether an incident (that isn't already
-# routed to POC_DATA by assignment group) is a data issue and should still
-# go to Jira, or is a general issue that belongs on ServiceDesk.
+# System prompt used to ask the LLM whether an incident is a data issue and
+# should go to Jira, or is a general issue that belongs on ServiceDesk.
 CLASSIFY_SYSTEM_PROMPT = """
 You are triaging IT support incidents for routing.
 
@@ -91,8 +86,8 @@ _llm_client = None
 def _get_llm():
     """
     Lazily build and cache the OpenAI chat model used for classification.
-    Only imported/instantiated when actually needed, so incidents that are
-    already resolved by assignment group never require an OpenAI call.
+    Only imported/instantiated when actually needed, so a poll with no new
+    incidents never requires an OpenAI call.
     """
     global _llm_client
     if _llm_client is None:
@@ -157,15 +152,12 @@ def _classify_with_llm(short_description: str, description: str) -> str:
 
 def categorize_incident(incident: Incident) -> str:
     """
-    Categorize an incident:
-    1. Assigned to the POC_DATA group -> "Jira".
-    2. Otherwise, ask an LLM (OpenAI) to read the short description and
-       description and decide whether it's a data issue ("Jira") or a
-       general issue ("ServiceDesk").
+    Categorize an incident by asking an LLM (OpenAI) to read the short
+    description and description and decide whether it's a data issue
+    ("Jira") or a general issue ("ServiceDesk"). The incident's current
+    assignment group is deliberately ignored -- every incident is
+    classified on its content.
     """
-    group = (incident.assignment_group or "").strip().lower().replace(" ", "_")
-    if group == JIRA_ASSIGNMENT_GROUP.lower():
-        return "Jira"
     return _classify_with_llm(incident.short_description, incident.description)
 
 
