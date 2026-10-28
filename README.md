@@ -286,6 +286,16 @@ Register-ScheduledTask -TaskName 'ServiceNow Incident Monitor' -Action $action -
 - The task only runs while you are logged in to Windows, and **Ollama must be
   running** to classify new incidents.
 
+**Where to see the output:** every scheduled run is added to
+`incident_monitor_scheduled.log` in the project root, under a
+`===== <date time> =====` header, with the same lines you see when you run the
+monitor by hand (new incidents, Jira/ServiceDesk routing, LLM usage summary).
+To watch it live, as if running it manually, leave this open in a terminal:
+```powershell
+Get-Content .\incident_monitor_scheduled.log -Wait -Tail 30
+```
+Classified incidents are also written to `new_incidents_ollama.csv`.
+
 Manage the task:
 ```powershell
 Get-Content .\incident_monitor_scheduled.log -Tail 20             # latest results
