@@ -266,6 +266,34 @@ python -m servicenow_jira_agent.incident_monitor_ollama
 python -m servicenow_jira_agent.incident_monitor_ollama --watch --interval 60
 ```
 
+**Scheduled monitoring** (Windows Task Scheduler, one poll every 10 minutes):
+
+`run_incident_monitor.ps1` runs a single poll from the project root and adds
+the output to `incident_monitor_scheduled.log`. Edit the Python path in the
+script if yours is different. Register it as a scheduled task once:
+```powershell
+$script = "$PWD\run_incident_monitor.ps1"
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`"" -WorkingDirectory $PWD
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 10)
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 9)
+Register-ScheduledTask -TaskName 'ServiceNow Incident Monitor' -Action $action -Trigger $trigger -Settings $settings
+```
+- Each run uses the same state file as `--watch`, so no incidents are missed
+  between runs. The full sweep (`--full-sweep-interval`, every 10th poll) now
+  happens about every 100 minutes.
+- If a poll is still running when the next one is due, the new one is skipped.
+  A run is stopped after 9 minutes.
+- The task only runs while you are logged in to Windows, and **Ollama must be
+  running** to classify new incidents.
+
+Manage the task:
+```powershell
+Get-Content .\incident_monitor_scheduled.log -Tail 20             # latest results
+Start-ScheduledTask   'ServiceNow Incident Monitor'               # run a poll now
+Disable-ScheduledTask 'ServiceNow Incident Monitor'               # pause (Enable-ScheduledTask resumes)
+Unregister-ScheduledTask 'ServiceNow Incident Monitor' -Confirm:$false   # remove
+```
+
 ### Step 9 — Test it end to end
 1. With the monitor running, create a new incident in ServiceNow that has a
    data-related description, for example *"Daily sales report shows
@@ -369,6 +397,8 @@ AI_POC/
   requirements.txt
   new_incidents_ollama.csv              # monitor output (git-ignored)
   .incident_monitor_ollama_state.json   # monitor state (git-ignored)
+  run_incident_monitor.ps1              # single poll for the scheduled task (Step 8)
+  incident_monitor_scheduled.log        # scheduled task output (git-ignored)
   servicenow_jira_agent/
     servicenow_client.py         # ServiceNow Table API: list_incidents(), update_incident()
     jira_client.py               # Jira REST v3: create_issue(), find_issue_by_summary_text(),
